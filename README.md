@@ -15,8 +15,14 @@ Zeitgeist (this repo)
 │   ├── 02-gate-analysis.md       # how zen decides (server-side, from source)
 │   ├── 03-header-approaches.md   # UA spoofing + X-Real-IP rotation attempts, all results
 │   ├── 04-the-loophole.md        # the WON path: local opencode serve session API
-│   └── 05-verification.md        # live test transcripts (HTTP 200s)
+│   ├── 05-verification.md        # live test transcripts (HTTP 200s)
+│   ├── 06-full-history-and-chat.md  # complete chronological account + user messages
+│   ├── 07-commands-runbook.md      # every command, reproduce on a fresh machine
+│   ├── 08-api-reference.md         # bridge/rotator endpoints & env
+│   ├── 09-evidence.md              # raw outputs explained
+│   └── 10-chat-transcript.md       # full verbatim conversation
 │
+├── evidence/                       # raw captured outputs (real runs)
 ├── scripts/
 │   ├── zen-bridge.js             # OpenAI-compat chat/completions -> serve session API
 │   └── zen-rotator.js            # injects a fresh X-Real-IP per request (limit reset)
@@ -26,8 +32,9 @@ Zeitgeist (this repo)
 │   ├── opencode-serve.service
 │   └── zen-rotator.service
 │
-└── config/
-    └── serve-opencode.json       # minimal serve config (whitelist big-pickle, rotator upstream)
+├── config/
+│   └── serve-opencode.json       # minimal serve config (whitelist big-pickle, rotator upstream)
+└── test.sh                        # smoke test (models list + chat completion)
 ```
 
 ---
