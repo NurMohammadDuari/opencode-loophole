@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=OpenCode Loophole Dashboard
+Comment=Control Center for OpenCode Zen Loophole, Free Models & Services
+Exec=/home/mint/.local/share/opencode/dashboard/launch-dashboard.sh
+Icon=/home/mint/.local/share/opencode/dashboard/icon.svg
+Terminal=false
+Type=Application
+Categories=Development;Utility;
+StartupWMClass=OpenCodeDashboard

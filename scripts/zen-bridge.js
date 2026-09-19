@@ -1,12 +1,23 @@
 const http = require("http");
 const https = require("https");
 const crypto = require("crypto");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 
 const SERVE_HOST = "127.0.0.1";
 const SERVE_PORT = Number(process.env.SERVE_PORT || 18765);
 const SERVE_USER = process.env.SERVE_USER || "opencode";
 const SERVE_PASS = process.env.SERVE_PASS || "opencodepass";
 const PORT = process.env.BRIDGE_PORT ? Number(process.env.BRIDGE_PORT) : 1338;
+const ACTIVITY_LOG = process.env.BRIDGE_ACTIVITY_LOG || path.join(os.homedir(), ".local", "share", "opencode", "bridge-activity.jsonl");
+
+function logActivity(entry) {
+  try {
+    const line = JSON.stringify({ ts: Date.now(), ...entry }) + "\n";
+    fs.appendFileSync(ACTIVITY_LOG, line);
+  } catch {}
+}
 
 const WHITELIST = [
   "big-pickle",
@@ -144,16 +155,43 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify({ object: "list", data: models }));
   }
 
+  if (urlPath === "/health" || urlPath === "/v1/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: true, service: "bridge", uptime: process.uptime() }));
+  }
+
+  if (urlPath === "/activity" && req.method === "GET") {
+    try {
+      const raw = fs.existsSync(ACTIVITY_LOG) ? fs.readFileSync(ACTIVITY_LOG, "utf8") : "";
+      const lines = raw.split(/\r?\n/).filter(Boolean).slice(-200);
+      const data = lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, entries: data }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+  }
+
   if ((urlPath === "/v1/chat/completions" || urlPath === "/chat/completions" || urlPath === "/v1/messages") && req.method === "POST") {
     let chunks = "";
+    const started = Date.now();
     req.on("data", (c) => { chunks += c; });
     req.on("end", () => {
       let body = {};
       try { body = JSON.parse(chunks || "{}"); } catch {}
-      handleChat(res, body, !!body.stream).catch((e) => {
-        if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: { message: "bridge: " + e.message } }));
-      });
+      const model = body.model || "big-pickle";
+      const streamReq = !!body.stream;
+      const t0 = Date.now();
+      handleChat(res, body, streamReq)
+        .then(() => {
+          logActivity({ event: "completion", model, stream: streamReq, status: 200, ms: Date.now() - t0, reqMs: t0 - started });
+        })
+        .catch((e) => {
+          logActivity({ event: "completion", model, stream: streamReq, status: e.status || 500, ms: Date.now() - t0, reqMs: t0 - started, error: e.message });
+          if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "bridge: " + e.message } }));
+        });
     });
     return;
   }

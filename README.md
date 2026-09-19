@@ -10,6 +10,12 @@ bypass that gives **no daily limit and time-reset** for the free models.
 ```
 Zeitgeist (this repo)
 │
+├── dashboard/                     # Control Center GUI app
+│   ├── dashboard-server.js        # Node HTTP & SQLite telemetry server (:1395)
+│   ├── launch-dashboard.sh        # Standalone window launcher (Chrome/Chromium app mode)
+│   ├── icon.svg                   # Vector application icon
+│   └── opencode-dashboard.desktop # Autostart and desktop application entry
+│
 ├── docs/
 │   ├── 01-extraction.md          # how the desktop app.asar was extracted
 │   ├── 02-gate-analysis.md       # how zen decides (server-side, from source)
@@ -28,12 +34,15 @@ Zeitgeist (this repo)
 │   └── zen-rotator.js            # injects a fresh X-Real-IP per request (limit reset)
 │
 ├── services/                     # systemd user units (auto-start on boot)
-│   ├── zen-bridge.service
-│   ├── opencode-serve.service
-│   └── zen-rotator.service
+│   ├── zen-bridge.service        # :1343 bridge
+│   ├── opencode-serve.service    # :18765 serve session
+│   ├── zen-rotator.service       # :1341 rotator
+│   ├── g4f-api.service           # :1337 g4f mirror pool
+│   └── opencode-dashboard.service# :1395 dashboard server
 │
 ├── config/
-│   └── serve-opencode.json       # minimal serve config (whitelist big-pickle, rotator upstream)
+│   ├── serve-opencode.json       # serve config (whitelist 31 models, rotator upstream)
+│   └── client-opencode.json      # user opencode config (routes to 1343 and 1337)
 └── test.sh                        # smoke test (models list + chat completion)
 ```
 
