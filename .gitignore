@@ -1,0 +1,8 @@
+node_modules/
+*.log
+*.bak
+.bak*
+.DS_Store
+servehome/
+home/
+tool-output/

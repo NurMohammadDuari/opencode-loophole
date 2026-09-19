@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenCode local serve (real OpenCode client session; passes zen Console gate)
+After=network-online.target zen-rotator.service
+
+[Service]
+Type=simple
+ExecStart=/home/mint/.opencode/bin/opencode serve --port 18765 --hostname 127.0.0.1
+Restart=on-failure
+RestartSec=5
+Environment=OPENCODE_SERVER_USERNAME=opencode
+Environment=OPENCODE_SERVER_PASSWORD=opencodepass
+Environment=OPENCODE_DISABLE_AUTOUPDATE=1
+Environment=HOME=/home/mint/.local/share/opencode/servehome
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=Zen OpenAI bridge (chat/completions -> local opencode serve session API)
+After=network-online.target opencode-serve.service
+
+[Service]
+Type=simple
+ExecStart=/home/mint/.nvm/versions/node/v24.21.0/bin/node /home/mint/.local/share/opencode/zen-bridge.js
+Restart=on-failure
+RestartSec=5
+Environment=BRIDGE_PORT=1343
+Environment=SERVE_PORT=18765
+Environment=SERVE_USER=opencode
+Environment=SERVE_PASS=opencodepass
+
+[Install]
+WantedBy=default.target
