@@ -652,38 +652,6 @@ function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<'
 let streamRunning = false;
 let es = null;
 async function toggleStream(){
-<<<<<<< HEAD
-  streamRunning=!streamRunning;
-  const btn=el('streamBtn');
-  if(streamRunning){
-    btn.textContent='■ Stop Stream'; btn.className='btn off';
-    // Use EventSource for Server‑Sent Events
-    es = new EventSource('/api/stream');
-    es.onmessage = e => {
-      try{
-        const d = JSON.parse(e.data);
-        if(d.entries && d.entries.length){
-          el('streamlog').textContent = d.entries.map(en =>
-            new Date(en.ts).toLocaleTimeString()+' '+en.model+' '+(en.stream?'[SSE]':'[JSON]')+' '+en.status+'ms'+(en.error?' ERR:'+en.error:'')+' path='+en.path
-          ).join('\n');
-          el('streamlog').scrollTop = el('streamlog').scrollHeight;
-          const last = d.entries[d.entries.length-1];
-          el('pipeline-path').textContent = last.path||'–';
-          el('pipeline-model').textContent = last.model||'–';
-        }
-      }catch{}
-    };
-    es.onerror = () => {
-      if(es){ es.close(); es = null; }
-      streamRunning = false;
-      btn.textContent='▶ Start Stream';
-      btn.className='btn';
-      toast('Stream stopped due to error');
-    };
-  } else {
-    btn.textContent='▶ Start Stream'; btn.className='btn';
-    if(es){ es.close(); es = null; }
-=======
   console.log('toggleStream called, current state:', streamRunning);
   streamRunning = !streamRunning;
   const btn = el('streamBtn');
@@ -723,7 +691,6 @@ async function toggleStream(){
     btn.textContent = '▶ Start Stream';
     btn.className = 'btn';
     if (es) { es.close(); es = null; }
->>>>>>> c7ee6d3 (chore: serve UI from static public folder, remove inline UI constant)
   }
 }
 

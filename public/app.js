@@ -65,3 +65,7 @@ function updateClock() {
 }
 setInterval(updateClock, 1000);
 updateClock();
+// Auto-start the SSE stream when the page loads
+document.addEventListener('DOMContentLoaded', () => {
+  toggleStream();
+});
