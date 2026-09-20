@@ -12,6 +12,7 @@ Environment=BRIDGE_PORT=1343
 Environment=SERVE_PORT=18765
 Environment=SERVE_USER=opencode
 Environment=SERVE_PASS=opencodepass
+Environment=HOME=/home/mint
 
 [Install]
 WantedBy=default.target

@@ -7,6 +7,7 @@ ExecStart=/home/mint/.nvm/versions/node/v24.21.0/bin/node /home/mint/.local/shar
 Restart=always
 RestartSec=3
 Environment=ZEN_ROTATOR_PORT=1341
+Environment=HOME=/home/mint
 
 [Install]
 WantedBy=default.target

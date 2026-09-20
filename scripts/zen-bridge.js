@@ -9,7 +9,7 @@ const SERVE_HOST = "127.0.0.1";
 const SERVE_PORT = Number(process.env.SERVE_PORT || 18765);
 const SERVE_USER = process.env.SERVE_USER || "opencode";
 const SERVE_PASS = process.env.SERVE_PASS || "opencodepass";
-const PORT = process.env.BRIDGE_PORT ? Number(process.env.BRIDGE_PORT) : 1338;
+const PORT = process.env.BRIDGE_PORT ? Number(process.env.BRIDGE_PORT) : 1343;
 const ACTIVITY_LOG = process.env.BRIDGE_ACTIVITY_LOG || path.join(os.homedir(), ".local", "share", "opencode", "bridge-activity.jsonl");
 
 function logActivity(entry) {
@@ -98,51 +98,96 @@ function buildOpenAiResponse(message, model, reqId) {
   };
 }
 
+async function callG4f(body) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(body);
+    const options = {
+      hostname: "127.0.0.1",
+      port: 1337,
+      path: "/v1/chat/completions",
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(data),
+      },
+    };
+    const req = http.request(options, (res) => {
+      let out = "";
+      res.on("data", (c) => { out += c; });
+      res.on("end", () => {
+        try { resolve({ status: res.statusCode, json: JSON.parse(out) }); }
+        catch { resolve({ status: res.statusCode, json: { raw: out } }); }
+      });
+    });
+    req.on("error", reject);
+    req.write(data);
+    req.end();
+  });
+}
+
 async function handleChat(res, body, stream) {
   const model = modelName(body.model);
-  const session = await callServe("POST", "/session", { directory: null });
-  if (session.status !== 200) {
-    res.writeHead(502, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ error: { message: "serve session: " + (session.json.raw || session.json.message || session.status) } }));
+  let sessionID = "none";
+  let tryG4f = false;
+
+  try {
+    const session = await callServe("POST", "/session", { directory: null });
+    if (session.status !== 200) {
+      console.error("Zen Bridge: Serve session failed, trying G4F fallback...");
+      tryG4f = true;
+    } else {
+      sessionID = session.json.id;
+      const textParts = (body.messages || []).map((m) => ({
+        type: "text",
+        text: (m.content || "").toString(),
+        id: "prt_" + crypto.randomBytes(12).toString("hex"),
+      }));
+      const payload = {
+        model: { providerID: "opencode", modelID: model },
+        parts: textParts,
+      };
+
+      const msg = await callServe("POST", `/session/${sessionID}/message`, payload);
+      if (msg.status !== 200) {
+        console.error("Zen Bridge: Serve message failed, trying G4F fallback...");
+        tryG4f = true;
+      } else {
+        const openaiRes = buildOpenAiResponse(msg.json, model, sessionID);
+        if (!stream) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify(openaiRes));
+        }
+
+        // Emit as a single SSE chunk then [DONE]; satisfies OpenAI stream clients.
+        const text = openaiRes.choices[0].message.content;
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        });
+        if (text) {
+          res.write(`data: ${JSON.stringify({ id: openaiRes.id, object: "chat.completion.chunk", created: openaiRes.created, model, choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }] })}\n\n`);
+        }
+        res.write(`data: ${JSON.stringify({ id: openaiRes.id, object: "chat.completion.chunk", created: openaiRes.created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+    }
+  } catch (e) {
+    console.error("Zen Bridge: Error in OpenCode chain, trying G4F fallback...", e.message);
+    tryG4f = true;
   }
-  const sessionID = session.json.id;
 
-  const textParts = (body.messages || []).map((m) => ({
-    type: "text",
-    text: (m.content || "").toString(),
-    id: "prt_" + crypto.randomBytes(12).toString("hex"),
-  }));
-  const payload = {
-    model: { providerID: "opencode", modelID: model },
-    parts: textParts,
-  };
-
-  const msg = await callServe("POST", `/session/${sessionID}/message`, payload);
-  if (msg.status !== 200) {
-    res.writeHead(502, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ error: { message: "serve message: " + (msg.json.raw || msg.json.message || msg.status), error: msg.json } }));
+  if (tryG4f) {
+    const g4fRes = await callG4f(body);
+    if (g4fRes.status === 200) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify(g4fRes.json));
+    } else {
+      res.writeHead(g4fRes.status, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: { message: "G4F Fallback failed: " + (g4fRes.json.raw || g4fRes.json.message || g4fRes.status) } }));
+    }
   }
-
-  const openaiRes = buildOpenAiResponse(msg.json, model, sessionID);
-
-  if (!stream) {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify(openaiRes));
-  }
-
-  // Emit as a single SSE chunk then [DONE]; satisfies OpenAI stream clients.
-  const text = openaiRes.choices[0].message.content;
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
-  if (text) {
-    res.write(`data: ${JSON.stringify({ id: openaiRes.id, object: "chat.completion.chunk", created: openaiRes.created, model, choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }] })}\n\n`);
-  }
-  res.write(`data: ${JSON.stringify({ id: openaiRes.id, object: "chat.completion.chunk", created: openaiRes.created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
-  res.write("data: [DONE]\n\n");
-  res.end();
 }
 
 const server = http.createServer((req, res) => {

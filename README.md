@@ -185,3 +185,14 @@ curl -s -X POST http://127.0.0.1:1343/v1/chat/completions \
 This is for understanding and interoperability research. Respect OpenCode's
 terms of service and rate-limit policies. Re-using someone else's backend to
 evade limits may violate their ToS.
+---
+
+## Boot fix (2026-09-20)
+
+Systemd unit files must **not** use unquoted paths containing spaces
+(e.g. `/home/.../Default Project/...`). After reboot that caused
+`Cannot find module '/home/mint/Documents/Default'` and
+`ECONNREFUSED 127.0.0.1:1343`.
+
+Installed units now point at space-free runtime paths under
+`~/.local/share/opencode/` and `Environment=HOME=.../servehome` for serve.

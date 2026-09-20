@@ -9,6 +9,7 @@ ExecStart=/home/mint/.nvm/versions/node/v24.21.0/bin/node /home/mint/.local/shar
 Restart=on-failure
 RestartSec=5
 Environment=NODE_ENV=production
+Environment=ZEN_TOKEN_FILE=/home/mint/.config/opencode/zen-tokens.txt
 
 [Install]
 WantedBy=default.target
