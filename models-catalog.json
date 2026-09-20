@@ -1,16 +1,13 @@
 {
   "updated": "2026-09-20",
-  "note": "31 free model ids exposed to OpenCode. Zen currently publishes ~9 free ids; others try exact id, then disclosed remap to a live zen free model, then g4f.",
+  "note": "31 free model ids exposed to OpenCode. zen_live_free = confirmed working directly on zen; others remap to a confirmed zen model or fall through to g4f fallback.",
   "zen_live_free": [
     "big-pickle",
-    "nemotron-3.5-lightning-free",
-    "nemotron-3-ultra-free",
     "muse-spark-1.3-contributor-free",
     "muse-spark-1.2-contributor-free",
     "mimo-v2.5-free",
-    "ling-3.0-flash-fin-free",
     "deepseek-v4-flash-free",
-    "jev-1.13-free"
+    "ling-3.0-flash-fin-free"
   ],
   "whitelist_31": [
     "big-pickle",
@@ -46,12 +43,15 @@
     "qwen3.6-plus-free"
   ],
   "remap_to_zen_live": {
+    "nemotron-3.5-lightning-free": "muse-spark-1.3-contributor-free",
+    "nemotron-3-ultra-free": "mimo-v2.5-free",
+    "jev-1.13-free": "deepseek-v4-flash-free",
     "hy3-preview-free": "muse-spark-1.3-contributor-free",
     "hy3-free": "muse-spark-1.2-contributor-free",
     "north-mini-code-free": "big-pickle",
     "minimax-m2.1-free": "mimo-v2.5-free",
     "minimax-m2.5-free": "mimo-v2.5-free",
-    "minimax-m3-free": "nemotron-3-ultra-free",
+    "minimax-m3-free": "mimo-v2.5-free",
     "longcat-2.0-free": "big-pickle",
     "laguna-s-2.1-free": "ling-3.0-flash-fin-free",
     "x-preview-f-free": "big-pickle",
@@ -59,14 +59,14 @@
     "ling-3.0-flash-free": "ling-3.0-flash-fin-free",
     "ling-3.0-tiny-free": "big-pickle",
     "kimi-k2.5-free": "muse-spark-1.3-contributor-free",
-    "ring-2.6-1t-free": "nemotron-3.5-lightning-free",
-    "nemotron-3-super-free": "nemotron-3-ultra-free",
+    "ring-2.6-1t-free": "muse-spark-1.3-contributor-free",
+    "nemotron-3-super-free": "mimo-v2.5-free",
     "trinity-large-preview-free": "muse-spark-1.2-contributor-free",
     "glm-4.7-free": "big-pickle",
     "glm-5-free": "mimo-v2.5-free",
     "mimo-v2-flash-free": "mimo-v2.5-free",
     "mimo-v2-omni-free": "mimo-v2.5-free",
-    "mimo-v2-pro-free": "nemotron-3-ultra-free",
+    "mimo-v2-pro-free": "mimo-v2.5-free",
     "qwen3.6-plus-free": "deepseek-v4-flash-free",
     "fast": "big-pickle",
     "fastest": "big-pickle",

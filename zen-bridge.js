@@ -14,11 +14,22 @@
  *    a 500 response mid-stream
  *  - session.idle detection made more robust: also watches session.updated with
  *    completed time, guards all res.write calls with settled/headersSent checks
- *  - BLANK OUTPUT FIX: when zen stream times out with fullText="" (no content),
+ *  - BLANK OUTPUT FIX v1: when zen stream times out with fullText="" (no content),
  *    the stream is NOT closed — instead emptyStream:true is returned and handleChat
  *    injects g4f fallback SSE chunks into the still-open stream before res.end().
  *    Previously the stream was closed with [DONE] and no text, causing blank output
  *    in the opencode CLI/app for any model that timed out on zen.
+ *  - BLANK OUTPUT FIX v2 (2026-09-20 session 2): session.idle fires BEFORE
+ *    message.part.delta events arrive (SSE race). flushAndFinish() and the isIdle
+ *    handler in both zenStreamResponsesToClient and zenStreamToClient now check
+ *    fullText==="" and treat that case as emptyStream (g4f fallback) instead of
+ *    emitting blank content. This fixes blank output for ALL models, not just
+ *    timed-out ones.
+ *  - REMAP TIMEOUT FIX: non-live models now use ZEN_REMAP_TIMEOUT_MS (30s default)
+ *    instead of ZEN_TIMEOUT_MS (150s) so g4f fallback kicks in quickly instead of
+ *    making users wait 2.5 minutes for a blank response.
+ *  - models-catalog.json updated: zen_live_free now contains only confirmed-working
+ *    zen models; all others remap to a confirmed live model.
  */
 const http = require("http");
 const crypto = require("crypto");
@@ -36,6 +47,8 @@ const G4F_PORT = Number(process.env.G4F_PORT || 1337);
 const G4F_FAST_MODEL = process.env.G4F_FAST_MODEL || "gemini-flash-lite";
 const FAST_RACE = process.env.FAST_RACE === "1"; // OFF by default — pure zen path
 const ZEN_TIMEOUT_MS = Number(process.env.ZEN_TIMEOUT_MS || 90000);
+// Shorter timeout for remapped (non-zen-live) models: if zen doesn't respond in 30s, fall through to g4f immediately
+const ZEN_REMAP_TIMEOUT_MS = Number(process.env.ZEN_REMAP_TIMEOUT_MS || 30000);
 const G4F_TIMEOUT_MS = Number(process.env.G4F_TIMEOUT_MS || 30000);
 
 const SHARE = path.join(os.homedir(), ".local", "share", "opencode");
@@ -271,7 +284,8 @@ function responsesBodyToChatBody(body) {
  *   response.output_item.done
  *   response.completed
  */
-function zenStreamResponsesToClient(res, model, chatBody) {
+function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
+  timeoutMs = timeoutMs || ZEN_TIMEOUT_MS;
   return new Promise(async (resolve, reject) => {
     const t0 = Date.now();
     let sessionID = null;
@@ -389,7 +403,7 @@ function zenStreamResponsesToClient(res, model, chatBody) {
         part: { type: "output_text", text: "", annotations: [] },
       });
 
-      const timer = setTimeout(() => finish(new Error("zen responses stream timeout")), ZEN_TIMEOUT_MS);
+      const timer = setTimeout(() => finish(new Error("zen responses stream timeout")), timeoutMs);
 
       let lastDeltaAt = Date.now();
       const stallCheck = setInterval(() => {
@@ -403,6 +417,20 @@ function zenStreamResponsesToClient(res, model, chatBody) {
 
       function flushAndFinish() {
         if (settled) return;
+        // BLANK OUTPUT FIX: if session went idle but we received zero text, the deltas
+        // haven't arrived yet (race condition: idle fires before message.part.delta over SSE).
+        // Treat it as emptyStream so the /v1/responses handler can inject g4f fallback content.
+        if (fullText === "") {
+          console.error("Zen Bridge: idle fired with empty text for", model, "-> emptyStream (will inject g4f)");
+          // Mark settled manually so finish() guard works correctly
+          settled = true;
+          if (sub) sub.close();
+          setTimeout(() => {
+            if (sessionID) callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {});
+          }, 2000);
+          resolve({ sessionID, text: "", tokens, ms: Date.now() - t0, path: "zen-responses-empty", streamErr: "idle-with-no-text", emptyStream: true, respId, itemId, created });
+          return;
+        }
         try {
           safeWrite({ type: "response.output_text.done", item_id: itemId, output_index: 0, content_index: 0, text: fullText });
           safeWrite({ type: "response.content_part.done", item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: fullText, annotations: [] } });
@@ -609,7 +637,8 @@ function buildParts(body) {
  *   attempting to write a 500 JSON response after SSE headers were sent.
  *   The client already received partial content and a graceful [DONE].
  */
-function zenStreamToClient(res, model, body) {
+function zenStreamToClient(res, model, body, timeoutMs) {
+  timeoutMs = timeoutMs || ZEN_TIMEOUT_MS;
   return new Promise(async (resolve, reject) => {
     const t0 = Date.now();
     let sessionID = null;
@@ -688,7 +717,7 @@ function zenStreamToClient(res, model, body) {
         })}\n\n`
       );
 
-      const timer = setTimeout(() => finish(new Error("zen stream timeout")), ZEN_TIMEOUT_MS);
+      const timer = setTimeout(() => finish(new Error("zen stream timeout")), timeoutMs);
 
       // Track how long since last delta to detect a stalled stream even without session.idle
       let lastDeltaAt = Date.now();
@@ -754,6 +783,13 @@ function zenStreamToClient(res, model, body) {
         if (isIdle) {
           clearTimeout(timer);
           clearInterval(stallCheck);
+          // BLANK OUTPUT FIX: idle fired before any delta events arrived (race condition).
+          // Resolve with emptyStream:true so handleChat can inject g4f fallback content.
+          if (fullText === "") {
+            console.error("Zen Bridge: idle fired with empty text for", model, "-> emptyStream (will inject g4f)");
+            finish(new Error("idle-with-no-text"));
+            return;
+          }
           try {
             res.write(
               `data: ${JSON.stringify({
@@ -908,9 +944,9 @@ async function handleChat(res, body, stream) {
     remapped = false;
   }
 
-  const tryZen = async (model, tag) => {
+  const tryZen = async (model, tag, timeoutOverride) => {
     if (stream) {
-      const meta = await zenStreamToClient(res, model, body);
+      const meta = await zenStreamToClient(res, model, body, timeoutOverride);
       // FIX: if zen returned an empty stream (timeout with no content), signal the caller
       // to inject g4f fallback content via the still-open SSE stream.
       if (meta.emptyStream) {
@@ -964,7 +1000,9 @@ async function handleChat(res, body, stream) {
     try {
       if (requested !== zenModel || FAST_ZEN.has(requested) || !remapped) {
         try {
-          const meta = await tryZen(requested, remapped ? "zen-exact" : "zen-live");
+          // Use shorter timeout for remapped (non-live) models so g4f fallback kicks in faster
+          const zenTimeout = (remapped || !FAST_ZEN.has(requested)) ? ZEN_REMAP_TIMEOUT_MS : ZEN_TIMEOUT_MS;
+          const meta = await tryZen(requested, remapped ? "zen-exact" : "zen-live", zenTimeout);
           // FIX: zen returned empty stream — inject g4f fallback into the still-open stream
           if (meta && meta.emptyStream) {
             console.error("Zen Bridge: zen returned empty for", requested, "-> g4f stream fallback");
@@ -1202,9 +1240,9 @@ const server = http.createServer((req, res) => {
 
       const doRequest = async () => {
         // Try zen path first
-        const tryZenResponses = async (mdl) => {
+        const tryZenResponses = async (mdl, timeoutOverride) => {
           if (streamReq) {
-            return await zenStreamResponsesToClient(res, mdl, chatBody);
+            return await zenStreamResponsesToClient(res, mdl, chatBody, timeoutOverride);
           }
           const result = await zenResponsesOnce(mdl, chatBody);
           res.writeHead(200, {
@@ -1253,7 +1291,9 @@ const server = http.createServer((req, res) => {
         };
 
         try {
-          const meta = await tryZenResponses(resolved.requested);
+          // Use shorter timeout for remapped (non-live) models so g4f fallback kicks in faster
+          const zenRespTimeout = FAST_ZEN.has(resolved.requested) ? ZEN_TIMEOUT_MS : ZEN_REMAP_TIMEOUT_MS;
+          const meta = await tryZenResponses(resolved.requested, zenRespTimeout);
           // FIX: zen returned empty stream — inject g4f fallback into the still-open Responses SSE stream
           if (meta && meta.emptyStream) {
             console.error("Zen Bridge /v1/responses: zen empty for", resolved.requested, "-> g4f stream fallback");
