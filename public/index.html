@@ -31,6 +31,9 @@
     <div id="chart" class="chart"></div>
   </section>
 
+  <!-- ══ CONTEXT WARNINGS ══ -->
+  <section class="panel ctx-banner" id="ctx-banner" hidden></section>
+
   <!-- ══ LIVE STREAM ══ -->
   <section class="panel">
     <h2>Live Completions <span class="dim">(realtime from bridge)</span></h2>
@@ -79,6 +82,12 @@
   <section class="panel">
     <h2>Usage by Model <span class="dim">(requests · tokens in/out · avg ms)</span></h2>
     <div id="model-stats" class="stats-table">No data yet.</div>
+  </section>
+
+  <!-- ══ DAILY TOKEN HISTORY ══ -->
+  <section class="panel">
+    <h2>Token History — per day <span class="dim">(persisted on disk, survives restarts · today highlighted)</span></h2>
+    <div id="daily-stats" class="stats-table">No history yet.</div>
   </section>
 
   <!-- ══ SESSIONS ══ -->

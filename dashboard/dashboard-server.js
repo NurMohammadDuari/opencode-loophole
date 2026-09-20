@@ -144,6 +144,7 @@ function usageSnapshot() {
   }
   const lastMin = minutes[minutes.length - 1];
   const models = [...byModel.values()].sort((a, b) => b.count - a.count);
+  const daily = dailyUsage();
   return {
     ts: now,
     totals: {
@@ -153,10 +154,14 @@ function usageSnapshot() {
       avgMs: totals.requests ? Math.round(totals.msSum / totals.requests) : 0,
       lastMinCount: lastMin ? lastMin.count : 0,
     },
+    daily,
+    today: daily.length ? daily[daily.length - 1] : null,
+    contextLimits: CONTEXT_LIMITS,
     minutes,
     byModel: models,
     byPath: Object.fromEntries([...byPath.entries()].sort((a, b) => b[1] - a[1])),
     lastEntries: ring.slice(-50).reverse(),
+    warnings: ring.slice(-200).filter((e) => e.context && e.context.level).slice(-10).reverse(),
   };
 }
 
@@ -291,6 +296,68 @@ const DB_CANDIDATES = [
   path.join(SERVEHOME_SHARE, "opencode.db"),
   path.join(SHARE, "opencode.db"),
 ];
+
+// ── Token history: daily JSONL files written by the bridge ───────────────────
+const HISTORY_DIR = process.env.TOKEN_HISTORY_DIR || path.join(SHARE, "token-history");
+const DAILY_DAYS = 7;
+
+function listHistoryFiles(days = DAILY_DAYS) {
+  try {
+    return fs.readdirSync(HISTORY_DIR)
+      .filter((f) => /^tokens-\d{4}-\d{2}-\d{2}\.jsonl$/.test(f))
+      .sort()
+      .slice(-days);
+  } catch { return []; }
+}
+
+function dailyUsage() {
+  const days = [];
+  for (const f of listHistoryFiles()) {
+    const day = f.replace(/^tokens-/, "").replace(/\.jsonl$/, "");
+    const agg = { day, requests: 0, ok: 0, fail: 0, inTok: 0, outTok: 0, totalTok: 0, inChars: 0, outChars: 0, msSum: 0, warnings: 0 };
+    try {
+      const raw = fs.readFileSync(path.join(HISTORY_DIR, f), "utf8");
+      for (const line of raw.split(/\r?\n/)) {
+        if (!line) continue;
+        let e; try { e = JSON.parse(line); } catch { continue; }
+        agg.requests++;
+        if (e.status === 200) agg.ok++; else agg.fail++;
+        const tok = e.tokens || null;
+        if (tok) {
+          agg.inTok += tok.input || tok.prompt || 0;
+          agg.outTok += tok.output || tok.completion || 0;
+          agg.totalTok += tok.total || (tok.input || 0) + (tok.output || 0);
+        }
+        agg.inChars += e.inChars || 0;
+        agg.outChars += e.outChars || 0;
+        agg.msSum += e.ms || 0;
+        if (e.context && e.context.level) agg.warnings++;
+      }
+    } catch {}
+    days.push(agg);
+  }
+  return days;
+}
+
+// Context limits come from the same catalog the bridge uses
+function loadContextLimits() {
+  const candidates = [
+    path.join(SERVEHOME_SHARE, "models-catalog.json"),
+    path.join(SHARE, "models-catalog.json"),
+    path.resolve(__dirname, "..", "models-catalog.json"),
+    path.resolve(__dirname, "..", "config", "models-catalog.json"),
+  ];
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c)) {
+        const cat = JSON.parse(fs.readFileSync(c, "utf8"));
+        if (cat.context_limits) return cat.context_limits;
+      }
+    } catch {}
+  }
+  return { _default: 128000 };
+}
+const CONTEXT_LIMITS = loadContextLimits();
 let db = null;
 function getDb() {
   if (db) { try { db.exec("SELECT 1"); return db; } catch { db = null; } }

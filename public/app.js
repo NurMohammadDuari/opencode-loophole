@@ -39,9 +39,14 @@ function renderUsage(usage) {
   $("u-inchars").textContent = fmt(t.inChars) + " chars sent";
   $("u-outchars").textContent = fmt(t.outChars) + " chars received";
   $("u-avg").textContent = t.requests ? "avg " + (t.avgMs / 1000).toFixed(1) + "s" : "\u00a0";
-  $("u-avgms").textContent = t.requests ? "avg " + (t.avgMs / 1000).toFixed(1) + "s / req" : "avg –";
+  const today = usage.today;
+  $("u-avgms").textContent = today
+    ? "today " + fmt(today.totalTok) + " tok · " + today.requests + " req"
+    : t.requests ? "avg " + (t.avgMs / 1000).toFixed(1) + "s / req" : "avg –";
   renderChart(usage.minutes || []);
   renderModelStats(usage.byModel || []);
+  renderDaily(usage.daily || []);
+  renderWarnings(usage);
 }
 
 /* ── 30-min bar chart ── */
@@ -67,6 +72,11 @@ function fmtTokens(tok) {
   const o = tok.output || tok.completion || 0;
   return i + "→" + o;
 }
+function ctxBadge(ctx) {
+  if (!ctx || !ctx.level) return "";
+  const cls = ctx.level === "critical" ? "ctx-badge crit" : "ctx-badge warn";
+  return ' <span class="' + cls + '">⚠ ' + ctx.pct + "%</span>";
+}
 function formatEntry(en) {
   const time = new Date(en.ts).toLocaleTimeString();
   const model = (en.resolved || en.model || "?").replace(/^opencode\//, "");
@@ -77,7 +87,7 @@ function formatEntry(en) {
   const chars = en.inChars != null || en.outChars != null ? en.inChars + "›" + (en.outChars || 0) + "ch" : "";
   const err = en.error ? " ERR:" + String(en.error).slice(0, 60) : "";
   const pth = en.path || "–";
-  return time + " " + model + " " + type + " " + status + " " + ms + " tok " + tok + " " + chars + " " + pth + err;
+  return time + " " + model + " " + type + " " + status + " " + ms + " tok " + tok + " " + chars + " " + pth + err + (en.context && en.context.level ? " [CTX " + en.context.pct + "%]" : "");
 }
 function renderLog(entries) {
   const log = $("streamlog");
@@ -86,7 +96,9 @@ function renderLog(entries) {
   const html = lastEntries.map((en) => {
     const line = formatEntry(en);
     const isErr = en.status !== 200 || !!en.error;
-    return isErr ? '<span class="e">' + escHtml(line) + "</span>" : escHtml(line);
+    const warn = en.context && en.context.level;
+    const cls = isErr ? "e" : warn ? (en.context.level === "critical" ? "ctx-crit" : "ctx-warn") : "";
+    return cls ? '<span class="' + cls + '">' + escHtml(line) + "</span>" : escHtml(line);
   }).join("\n");
   log.innerHTML = html;
   log.scrollTop = log.scrollHeight;
@@ -95,12 +107,14 @@ function renderLog(entries) {
   const last = entries[entries.length - 1];
   if (last) {
     const tok = last.tokens || null;
+    const ctx = last.context || null;
     $("last-detail").innerHTML =
       '<b>' + escHtml((last.resolved || last.model || "?").replace(/^opencode\//, "")) + "</b>" +
       ' · path=' + escHtml(last.path || "–") +
       ' · ' + escHtml(String(last.ms != null ? (last.ms / 1000).toFixed(1) + "s" : "–")) +
       ' · tokens <span class="t">in ' + escHtml(fmtTokens(tok)) + "</span>" +
       ' · context <span class="t">' + escHtml((last.inChars || 0) + " chars in / " + (last.outChars || 0) + " out") + "</span>" +
+      (ctx ? ' · <span class="' + (ctx.level === "critical" ? "e" : "t") + '">limit ' + escHtml(fmt(ctx.limit)) + " tok (" + ctx.pct + "%)" + (ctx.level ? " — " + escHtml(ctx.level) : "") + "</span>" : "") +
       (last.error ? ' · <span class="e">error: ' + escHtml(String(last.error).slice(0, 120)) + "</span>" : "");
   }
 }
@@ -126,6 +140,42 @@ function renderServices(status) {
       + "<b>" + escHtml(s.label) + "</b> <span class='dim'>:" + s.port + pid + health + "</span>"
       + "<br><span class='dim desc'>" + escHtml(s.desc) + "</span>"
       + btns + "</div>";
+  }).join("");
+}
+
+/* ── daily history ── */
+function renderDaily(daily) {
+  const box = $("daily-stats");
+  if (!box) return;
+  if (!daily || !daily.length) { box.innerHTML = '<span class="dim">No history yet.</span>'; return; }
+  const rows = daily.slice().reverse().map((d) => {
+    const avg = d.requests ? Math.round(d.msSum / d.requests) : 0;
+    return "<tr"
+      + (d === daily[daily.length - 1] ? " class='today'" : "")
+      + "><td class='mono'>" + escHtml(d.day) + "</td>"
+      + "<td>" + d.requests + "</td>"
+      + "<td>" + (d.fail ? "<span class='e'>" + d.fail + "</span>" : "0") + "</td>"
+      + "<td class='t'>" + fmt(d.inTok) + "</td>"
+      + "<td class='t'>" + fmt(d.outTok) + "</td>"
+      + "<td class='t'>" + fmt(d.totalTok) + "</td>"
+      + "<td>" + (d.warnings ? "<span class='e'>⚠ " + d.warnings + "</span>" : "0") + "</td>"
+      + "<td>" + (avg / 1000).toFixed(1) + "s</td></tr>";
+  }).join("");
+  box.innerHTML = "<table><thead><tr><th>day</th><th>req</th><th>fail</th><th>tok in</th><th>tok out</th><th>total</th><th>ctx warns</th><th>avg</th></tr></thead><tbody>" + rows + "</tbody></table>";
+}
+
+/* ── context warning banner ── */
+function renderWarnings(usage) {
+  const box = $("ctx-banner");
+  if (!box) return;
+  const w = (usage && usage.warnings) || [];
+  if (!w.length) { box.hidden = true; box.innerHTML = ""; return; }
+  box.hidden = false;
+  box.innerHTML = w.slice(0, 3).map((e) => {
+    const cls = e.context.level === "critical" ? "crit" : "warn";
+    return '<div class="ctx-row ' + cls + '">⚠ <b>' + escHtml((e.resolved || e.model || "?").replace(/^opencode\//, ""))
+      + "</b> " + escHtml(e.context.pct + "% of " + fmt(e.context.limit) + " tok")
+      + " — " + escHtml(e.context.message || "") + "</div>";
   }).join("");
 }
 
@@ -250,10 +300,18 @@ function runTest() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ model }),
   })
-    .then((r) => r.json())
+    .then((r) => {
+      const ctx = r.headers.get("x-context-warning");
+      const pct = r.headers.get("x-context-usage");
+      const lim = r.headers.get("x-context-limit");
+      window.__testCtx = ctx ? { ctx, pct, lim } : null;
+      return r.json();
+    })
     .then((j) => {
+      const c = window.__testCtx;
       out.innerHTML = j.ok
         ? '<span class="good">OK ' + (j.ms / 1000).toFixed(1) + "s — " + escHtml(String(j.reply).slice(0, 60)) + "</span>"
+          + (c ? ' <span class="ctx-badge ' + (c.ctx === "critical" ? "crit" : "warn") + '">⚠ ' + escHtml(c.ctx + " " + c.pct + " of " + fmt(c.lim) + " tok") + "</span>" : "")
         : '<span class="e">FAIL ' + j.status + " — " + escHtml(String(j.reply).slice(0, 80)) + "</span>";
     })
     .catch((e) => { out.innerHTML = '<span class="e">error: ' + escHtml(e.message) + "</span>"; });

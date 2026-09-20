@@ -78,6 +78,50 @@ if (!catalogLoaded) console.error("catalog load failed — using big-pickle fall
 const FAST_ZEN = new Set(CATALOG.zen_live_free || ["big-pickle"]);
 const MODEL_REMAP = CATALOG.remap_to_zen_live || {};
 const WHITELIST = CATALOG.whitelist_31 || ["big-pickle"];
+const CONTEXT_LIMITS = CATALOG.context_limits || {};
+const CTX_WARN_PCT = Number(process.env.CTX_WARN_PCT || 75);
+const CTX_CRIT_PCT = Number(process.env.CTX_CRIT_PCT || 90);
+
+// ── Token history persistence (daily JSONL, survives reboots) ────────────────
+const HISTORY_DIR = process.env.TOKEN_HISTORY_DIR || path.join(SHARE, "token-history");
+const HISTORY_RETENTION_DAYS = Number(process.env.TOKEN_HISTORY_DAYS || 90);
+function historyFileFor(ts) {
+  const d = new Date(ts);
+  const day = d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+  return path.join(HISTORY_DIR, "tokens-" + day + ".jsonl");
+}
+function persistHistory(entry) {
+  try {
+    fs.mkdirSync(HISTORY_DIR, { recursive: true });
+    fs.appendFileSync(historyFileFor(entry.ts || Date.now()), JSON.stringify(entry) + "\n");
+  } catch {}
+}
+function contextLimitFor(modelId) {
+  if (!modelId) return CONTEXT_LIMITS._default || 128000;
+  const raw = String(modelId).split("/").pop().replace(VARIANT_SUFFIX_RE, "");
+  return CONTEXT_LIMITS[raw] || CONTEXT_LIMITS[modelId] || CONTEXT_LIMITS._default || 128000;
+}
+function contextWarning(requestedModel, zenModel, inChars, inTok) {
+  const limit = contextLimitFor(zenModel || requestedModel);
+  // Use the LARGER of real tokens and the raw-request char estimate (chars/4),
+  // so a huge request that got compacted before the model still warns.
+  // Floor of 3k keeps tiny requests from reading 0%.
+  const used = Math.max(inTok || 0, Math.ceil((inChars || 0) / 4), 3000);
+  const pct = Math.min(999, Math.round((used / limit) * 100));
+  let level = null;
+  if (pct >= CTX_CRIT_PCT) level = "critical";
+  else if (pct >= CTX_WARN_PCT) level = "warning";
+  const messages = {
+    critical: "request is near/past " + (zenModel || requestedModel) + " context limit — expect truncation or recovery fallback",
+    warning: "request is using " + pct + "% of " + (zenModel || requestedModel) + " context — consider a smaller history",
+  };
+  return {
+    level, pct,
+    limit,
+    usedTokensEstimate: used,
+    message: level ? messages[level] : null,
+  };
+}
 
 let lastProof = {
   ts: 0, real: true,
@@ -86,7 +130,9 @@ let lastProof = {
 };
 
 function logActivity(entry) {
-  try { fs.appendFileSync(ACTIVITY_LOG, JSON.stringify({ ts: Date.now(), ...entry }) + "\n"); } catch {}
+  const full = { ts: Date.now(), ...entry };
+  try { fs.appendFileSync(ACTIVITY_LOG, JSON.stringify(full) + "\n"); } catch {}
+  if (full.event === "completion") persistHistory(full);
 }
 
 function writeProof(p) {
@@ -918,9 +964,13 @@ async function handleChat(res, body, stream) {
       return { path: meta.path || tag, model, requested, remapped: model !== requested, ...meta };
     }
     const result = await zenOnce(model, body);
+    const ctxHdr = contextWarning(requested, model, messagesCharCount(body && body.messages), (result.tokens && (result.tokens.input || result.tokens.prompt)) || 0);
     res.writeHead(200, {
       "Content-Type": "application/json",
-      ...proofHeaders({ "x-loophole-path": tag, "x-loophole-session": result.sessionID || "", "x-loophole-model": model, "x-loophole-requested": requested, "x-loophole-remapped": model !== requested ? "1" : "0" }),
+      ...proofHeaders({
+        "x-loophole-path": tag, "x-loophole-session": result.sessionID || "", "x-loophole-model": model, "x-loophole-requested": requested, "x-loophole-remapped": model !== requested ? "1" : "0",
+        ...(ctxHdr.level ? { "x-context-warning": ctxHdr.level, "x-context-usage": ctxHdr.pct + "%", "x-context-limit": String(ctxHdr.limit) } : {}),
+      }),
     });
     res.end(JSON.stringify(result.openaiRes));
     return { path: tag, model, requested, remapped: model !== requested, tokens: result.tokens, inChars: result.inChars, outChars: result.outChars };
@@ -1021,10 +1071,14 @@ const server = http.createServer((req, res) => {
       const t0 = Date.now();
       handleChat(res, body, streamReq)
         .then((meta) => {
-          logActivity({ event: "completion", model, resolved: meta && meta.model, path: meta && meta.path, stream: streamReq, status: 200, ms: Date.now() - t0, reqMs: t0 - started, inChars: messagesCharCount(body && body.messages), outChars: meta && meta.outChars != null ? meta.outChars : (meta && meta.text ? String(meta.text).length : 0), tokens: (meta && meta.tokens) || null, real: true });
+          const inC = messagesCharCount(body && body.messages);
+          const toks = (meta && meta.tokens) || null;
+          const usedTok = toks ? (toks.input || toks.prompt || 0) : 0;
+          logActivity({ event: "completion", model, resolved: meta && meta.model, path: meta && meta.path, stream: streamReq, status: 200, ms: Date.now() - t0, reqMs: t0 - started, inChars: inC, outChars: meta && meta.outChars != null ? meta.outChars : (meta && meta.text ? String(meta.text).length : 0), tokens: toks, context: contextWarning(model, (meta && meta.model) || model, inC, usedTok), real: true });
         })
         .catch((e) => {
-          logActivity({ event: "completion", model, stream: streamReq, status: e.status || 500, ms: Date.now() - t0, reqMs: t0 - started, inChars: messagesCharCount(body && body.messages), error: e.message, real: true });
+          const inC = messagesCharCount(body && body.messages);
+          logActivity({ event: "completion", model, stream: streamReq, status: e.status || 500, ms: Date.now() - t0, reqMs: t0 - started, inChars: inC, error: e.message, context: contextWarning(model, model, inC, 0), real: true });
           if (!res.headersSent) {
             res.writeHead(e.status || 500, { "Content-Type": "application/json", ...proofHeaders() });
             res.end(JSON.stringify({ error: { message: "bridge: " + e.message } }));
@@ -1111,10 +1165,14 @@ const server = http.createServer((req, res) => {
 
       doRequest()
         .then((meta) => {
-          logActivity({ event: "completion", api: "responses", model, resolved: meta && meta.model, path: meta && meta.path, stream: streamReq, status: 200, ms: Date.now() - t0, reqMs: t0 - started, inChars: messagesCharCount(chatBody && chatBody.messages), outChars: meta && meta.text ? String(meta.text).length : 0, tokens: (meta && meta.tokens) || null, real: true });
+          const inC = messagesCharCount(chatBody && chatBody.messages);
+          const toks = (meta && meta.tokens) || null;
+          const usedTok = toks ? (toks.input || 0) : 0;
+          logActivity({ event: "completion", api: "responses", model, resolved: meta && meta.model, path: meta && meta.path, stream: streamReq, status: 200, ms: Date.now() - t0, reqMs: t0 - started, inChars: inC, outChars: meta && meta.text ? String(meta.text).length : 0, tokens: toks, context: contextWarning(model, (meta && meta.model) || model, inC, usedTok), real: true });
         })
         .catch((e) => {
-          logActivity({ event: "completion", api: "responses", model, stream: streamReq, status: e.status || 500, ms: Date.now() - t0, reqMs: t0 - started, inChars: messagesCharCount(chatBody && chatBody.messages), error: e.message, real: true });
+          const inC = messagesCharCount(chatBody && chatBody.messages);
+          logActivity({ event: "completion", api: "responses", model, stream: streamReq, status: e.status || 500, ms: Date.now() - t0, reqMs: t0 - started, inChars: inC, error: e.message, context: contextWarning(model, model, inC, 0), real: true });
           if (!res.headersSent) {
             res.writeHead(e.status || 500, { "Content-Type": "application/json", ...proofHeaders() });
             res.end(JSON.stringify({ error: { message: "bridge: " + e.message } }));

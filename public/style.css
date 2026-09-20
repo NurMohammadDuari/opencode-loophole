@@ -197,6 +197,48 @@ button:active, .btn:active {
   color: #1a5a1a;
 }
 
+/* ── context warnings ── */
+.ctx-banner {
+  background: #fff3cd;
+  border-color: #b8860b;
+}
+.ctx-row {
+  font-size: 12px;
+  padding: 4px 8px;
+  margin: 3px 0;
+  border: 1px solid #b8860b;
+  background: #fff8e0;
+}
+.ctx-row.crit {
+  background: #ffd8d8;
+  border-color: #cc3333;
+  color: #7a1010;
+  font-weight: bold;
+}
+.ctx-warn { color: #9a6b00; }
+.ctx-crit { color: #cc3333; font-weight: bold; }
+.ctx-badge {
+  display: inline-block;
+  background: #fff3cd;
+  border: 1px solid #b8860b;
+  color: #7a5b00;
+  border-radius: 2px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: bold;
+}
+.ctx-badge.crit {
+  background: #ffd8d8;
+  border-color: #cc3333;
+  color: #7a1010;
+}
+
+/* daily table highlight for today */
+.stats-table tr.today td {
+  background: #fdf6d8;
+  font-weight: bold;
+}
+
 /* ── stats tables ── */
 .stats-table table {
   width: 100%;

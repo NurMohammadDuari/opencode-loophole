@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-20e — Persisted token history + context warnings
+
+- Bridge persists every completion to daily JSONL files
+  (`~/.local/share/opencode/.../token-history/tokens-YYYY-MM-DD.jsonl`) — token
+  history now survives reboots; 90-day retention, prunable via TOKEN_HISTORY_DAYS
+- Context limits per model added to models-catalog.json (context_limits, 128k
+  default, big-pickle 190k, kimi-k2.5 256k)
+- Bridge computes a context-usage estimate per request (larger of real tokens vs
+  raw-char estimate) and logs it; level warning at 75% / critical at 90% of limit
+  (CTX_WARN_PCT / CTX_CRIT_PCT); non-stream replies also carry
+  x-context-warning / x-context-usage / x-context-limit headers
+- Dashboard shows a warning banner for recent near-limit requests, ⚠ badges in
+  the live stream and chain test, and a new per-day Token History table
+  (requests, failures, tokens in/out/total, context warnings, avg time) with
+  today highlighted
+- Verified live: normal request → 2% no flag; 700k-char request → critical 92%
+  surfaced in history, banner and today's warning count
+
 ## 2026-09-20d — Realtime usage dashboard + g4f fully removed
 
 - Bridge now logs tokens (input/output/total/reasoning/cache) and context chars
