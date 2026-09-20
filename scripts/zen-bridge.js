@@ -281,10 +281,18 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
 
       function flushAndFinish() {
         if (settled) return;
-        // Idle fired before deltas arrived — send error instead of blank
+        // If idle fired but no text yet, wait up to 2s for late-arriving deltas
+        // (SSE race: session.idle can arrive before message.part.delta over the stream)
         if (fullText === "") {
-          console.error("Zen Bridge: idle-before-delta for", model, "— closing with error");
-          finish(new Error("idle-with-no-text"));
+          setTimeout(() => {
+            if (settled) return;
+            if (fullText === "") {
+              console.error("Zen Bridge: idle-before-delta for", model, "— no text after 2s wait, closing with error");
+              finish(new Error("idle-with-no-text"));
+            } else {
+              flushAndFinish(); // text arrived during the wait — flush normally
+            }
+          }, 2000);
           return;
         }
         try {
@@ -513,10 +521,24 @@ function zenStreamToClient(res, model, body, timeoutMs) {
 
         if (isIdle) {
           clearTimeout(timer); clearInterval(stallCheck);
-          // Idle-before-delta race: error instead of blank
+          // Idle-before-delta race: wait up to 2s for late-arriving deltas before giving up
           if (fullText === "") {
-            console.error("Zen Bridge: idle-before-delta for", model, "— error response");
-            finish(new Error("idle-with-no-text"));
+            setTimeout(() => {
+              if (settled) return;
+              if (fullText === "") {
+                console.error("Zen Bridge: idle-before-delta for", model, "— no text after 2s wait, error response");
+                finish(new Error("idle-with-no-text"));
+              } else {
+                // Text arrived during wait — close normally
+                try {
+                  res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+                  res.write("data: [DONE]\n\n");
+                  res.end();
+                } catch {}
+                writeProof({ path: "zen-stream", sessionID, model, ms: Date.now() - t0, chars: fullText.length, tokens, rotator: readRotatorTail(3), sample: fullText.slice(0, 160) });
+                finish(null);
+              }
+            }, 2000);
             return;
           }
           try {
