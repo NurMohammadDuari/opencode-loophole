@@ -13,7 +13,8 @@
  *  - SSE "failed after headers sent" race: finish(err) resolves instead of rejects
  *  - idle-before-delta blank output fix: flushAndFinish() + isIdle handler check
  *    fullText==="" and close the stream with an error instead of blank content
- *  - Non-live models use ZEN_REMAP_TIMEOUT_MS (30s) for faster failure
+ *  - Activity-based deadlines: no more 25s empty-stream kill or 30s remap cap
+ *    that aborted healthy desktop agent turns (blank output / endless thinking)
  *  - models-catalog remap: non-working zen models route to a confirmed live model
  */
 const http = require("http");
@@ -28,13 +29,21 @@ const SERVE_USER = process.env.SERVE_USER || "opencode";
 const SERVE_PASS = process.env.SERVE_PASS || "opencodepass";
 const PORT = process.env.BRIDGE_PORT ? Number(process.env.BRIDGE_PORT) : 1343;
 const FAST_RACE = process.env.FAST_RACE === "1";
-const ZEN_TIMEOUT_MS = Number(process.env.ZEN_TIMEOUT_MS || 90000);
-// Shorter timeout for remapped (non-zen-live) models
-const ZEN_REMAP_TIMEOUT_MS = Number(process.env.ZEN_REMAP_TIMEOUT_MS || 30000);
+const ZEN_TIMEOUT_MS = Number(process.env.ZEN_TIMEOUT_MS || 180000);
 // Desktop agent turns often ship huge histories; keep under zen context limits
 const MAX_PROMPT_CHARS = Number(process.env.MAX_PROMPT_CHARS || 28000);
 const MAX_SYSTEM_CHARS = Number(process.env.MAX_SYSTEM_CHARS || 6000);
-const EMPTY_STREAM_GRACE_MS = Number(process.env.EMPTY_STREAM_GRACE_MS || 25000);
+// How long a stream may stay silent before we consider it stalled.
+// Desktop agent turns legitimately spend 20-30s+ on tool calls/file reads before
+// the first text delta — killing them at 25s produced the "[zen: no response]"
+// blank-output bug. We now wait for real activity.
+const EMPTY_STREAM_GRACE_MS = Number(process.env.EMPTY_STREAM_GRACE_MS || 90000);
+// Hard cap for recovery fan-out so failures return in seconds/minutes, not 10+ min
+const RECOVERY_TIMEOUT_MS = Number(process.env.RECOVERY_TIMEOUT_MS || 45000);
+const RECOVERY_MAX_ATTEMPTS = Number(process.env.RECOVERY_MAX_ATTEMPTS || 3);
+// How long a session may sit idle after its run finished before we delete it.
+// Deleting too early breaks serve's in-flight run (SQLite FOREIGN KEY failures).
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 90000);
 const VARIANT_SUFFIX_RE = /-(?:xhigh|high|max|medium|low|fast|thinking|mini|nano)$/i;
 
 const SHARE = path.join(os.homedir(), ".local", "share", "opencode");
@@ -201,7 +210,7 @@ function extractAssistantText(messages) {
   return { text, tokens };
 }
 
-/** When stream idles with no text, sync-retry same model then big-pickle (compacted). */
+/** When stream idles with no text, retry with progressively smaller bodies + big-pickle. */
 async function recoverTextAfterEmpty(model, chatBody) {
   const bodies = [
     compactChatBody(chatBody, MAX_PROMPT_CHARS),
@@ -209,26 +218,28 @@ async function recoverTextAfterEmpty(model, chatBody) {
     lastUserOnlyBody(chatBody),
   ];
   const models = [model, "big-pickle"];
-  for (const body of bodies) {
-    for (const mdl of models) {
-      try {
-        const result = await zenOnce(mdl, body, 45000);
-        const text = ((((result.openaiRes || {}).choices || [])[0] || {}).message || {}).content || "";
-        if (text && String(text).trim()) {
-          return {
-            text: String(text),
-            model: mdl,
-            tokens: (result.openaiRes && result.openaiRes.usage) || null,
-            path: mdl === model ? "zen-sync-recover" : "zen-bigpickle-recover",
-            sessionID: result.sessionID,
-          };
-        }
-      } catch (e) {
-        const msg = e.message || "";
-        console.error("Zen Bridge: recover via", mdl, "failed:", msg.slice(0, 220));
-        // Overflow / invalid params → try smaller body next
-        if (/ContextOverflow|invalid_request|invalid parameters|too large/i.test(msg)) continue;
+  // Bounded fan-out: 3 attempts max so a dead upstream fails in seconds, not minutes.
+  const attempts = Math.min(RECOVERY_MAX_ATTEMPTS, bodies.length * models.length);
+  for (let i = 0; i < attempts; i++) {
+    const body = bodies[i % bodies.length];
+    const mdl = models[Math.floor(i / bodies.length) % models.length];
+    try {
+      const result = await zenOnce(mdl, body, RECOVERY_TIMEOUT_MS);
+      const text = ((((result.openaiRes || {}).choices || [])[0] || {}).message || {}).content || "";
+      if (text && String(text).trim()) {
+        return {
+          text: String(text),
+          model: mdl,
+          tokens: (result.openaiRes && result.openaiRes.usage) || null,
+          path: mdl === model ? "zen-sync-recover" : "zen-bigpickle-recover",
+          sessionID: result.sessionID,
+        };
       }
+    } catch (e) {
+      const msg = e.message || "";
+      console.error("Zen Bridge: recover via", mdl, "failed:", msg.slice(0, 220));
+      // Overflow / invalid params → try smaller body next
+      if (/ContextOverflow|invalid_request|invalid parameters|too large/i.test(msg)) continue;
     }
   }
   return null;
@@ -394,8 +405,8 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
       settled = true;
       if (sub) sub.close();
       setTimeout(() => {
-        if (sessionID) callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {});
-      }, 2000);
+        if (sessionID) callServe("DELETE", `/session/${sessionID}`, SESSION_TTL_MS).catch(() => {});
+      }, SESSION_TTL_MS);
       if (err) {
         if (res.headersSent) {
           if (fullText === "") {
@@ -466,7 +477,9 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
         if (settled) { clearInterval(stallCheck); return; }
         // No text at all after grace → recover instead of waiting full timeout (desktop "thinking" forever)
         if (fullText.length === 0 && Date.now() - streamStartedAt > EMPTY_STREAM_GRACE_MS) {
-          clearInterval(stallCheck); clearTimeout(timer); flushAndFinish();
+          clearInterval(stallCheck); clearTimeout(timer);
+          console.error("Zen Bridge: no first delta after", EMPTY_STREAM_GRACE_MS, "ms for", model, "— recovering");
+          flushAndFinish();
           return;
         }
         if (fullText.length > 0 && Date.now() - lastDeltaAt > 15000) {
@@ -555,7 +568,9 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
           (type === "session.status" && props.status && props.status.type === "idle") ||
           (type === "session.updated" && props.session && props.session.time && props.session.time.completed);
 
-        if (isIdle) { clearTimeout(timer); clearInterval(stallCheck); flushAndFinish(); }
+        // If we already streamed text, idle means DONE — never touch the session
+        // after this point (early DELETE caused FOREIGN KEY failures + blank output).
+        if (isIdle && fullText !== "") { clearTimeout(timer); clearInterval(stallCheck); flushAndFinish(); }
       });
 
       await new Promise((r) => setTimeout(r, 80));
@@ -667,7 +682,7 @@ function zenStreamToClient(res, model, body, timeoutMs) {
       if (settled) return;
       settled = true;
       if (sub) sub.close();
-      setTimeout(() => { if (sessionID) callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {}); }, 2000);
+      setTimeout(() => { if (sessionID) callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {}); }, SESSION_TTL_MS);
 
       if (err) {
         if (res.headersSent) {
@@ -716,6 +731,7 @@ function zenStreamToClient(res, model, body, timeoutMs) {
         if (settled) { clearInterval(stallCheck); return; }
         if (fullText.length === 0 && Date.now() - streamStartedAt > EMPTY_STREAM_GRACE_MS) {
           clearInterval(stallCheck); clearTimeout(timer);
+          console.error("Zen Bridge: no first delta after", EMPTY_STREAM_GRACE_MS, "ms for", model, "— recovering");
           recoverOrFinish();
           return;
         }
@@ -813,7 +829,7 @@ function zenStreamToClient(res, model, body, timeoutMs) {
           (type === "session.status" && props.status && props.status.type === "idle") ||
           (type === "session.updated" && props.session && props.session.time && props.session.time.completed);
 
-        if (isIdle) {
+        if (isIdle && fullText !== "") {
           clearTimeout(timer); clearInterval(stallCheck);
           recoverOrFinish();
         }
@@ -876,7 +892,9 @@ async function zenOnce(model, body, timeoutOverride) {
     writeProof({ path: "zen-sync", sessionID, model, tokens: msg.json.info && msg.json.info.tokens, rotator: readRotatorTail(3), sample: text.slice(0, 160) });
     return { openaiRes, sessionID, path: "zen-sync" };
   } finally {
-    callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {});
+    // Give serve time to fully release the run before deleting — an immediate
+    // DELETE triggered SQLite FOREIGN KEY constraint failures in serve.
+    setTimeout(() => { callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {}); }, 1500);
   }
 }
 
@@ -905,7 +923,9 @@ async function handleChat(res, body, stream) {
   };
 
   try {
-    const zenTimeout = (remapped || !FAST_ZEN.has(requested)) ? ZEN_REMAP_TIMEOUT_MS : ZEN_TIMEOUT_MS;
+    // Single hard timeout for every model — the old 30s "remap" cap killed
+    // healthy long agent turns before they produced output.
+    const zenTimeout = ZEN_TIMEOUT_MS;
     // Use the resolved zen model directly — don't try an unknown model name first
     const modelToTry = remapped ? zenModel : requested;
     const meta = await tryZen(modelToTry, remapped ? "zen-remap" : "zen-live", zenTimeout);
@@ -1035,7 +1055,7 @@ const server = http.createServer((req, res) => {
           return result;
         };
 
-        const zenRespTimeout = FAST_ZEN.has(resolved.requested) ? ZEN_TIMEOUT_MS : ZEN_REMAP_TIMEOUT_MS;
+        const zenRespTimeout = ZEN_TIMEOUT_MS;
         // Use the resolved zen model directly — no point trying the original name if it's remapped
         const modelToTry = resolved.remapped ? zenModel : resolved.requested;
 

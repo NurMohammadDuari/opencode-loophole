@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-20c — Desktop blank output / endless "thinking" fixed at the root
+
+Root cause: the bridge aborted healthy agent runs on fixed timers, then deleted the
+serve session while the run was still active (SQLite FOREIGN KEY failures in serve).
+
+- Activity-based deadlines: EMPTY_STREAM_GRACE_MS 25s → 90s (desktop builds spend
+  20-30s on tool calls before the first text delta)
+- Absolute ZEN_TIMEOUT_MS 90s → 180s; removed the 30s ZEN_REMAP_TIMEOUT_MS cap that
+  killed long agent turns on remapped models
+- Session DELETE now deferred 90s (SESSION_TTL_MS) so in-flight runs are never orphaned
+  — no more UnknownError / blank output from FK constraint failures
+- Idle after deltas now = clean DONE (no fetch, no recovery, no extra session churn)
+- Recovery fan-out capped at 3 attempts (was 6 sequential 45s retries = 10-min hang)
+- Removed stale g4f env vars from zen-bridge.service and duplicate scripts/
+- Verified live: muse-spark sync + SSE + /v1/responses, big-pickle, remapped models
+  (glm-5-free, kimi-k2.5-free, hy3-free), 31k-char and 700k-char desktop-style turns,
+  3-turn agent session — all return real text, no blanks
+
 ## [Unreleased]
 - Refactored UI to serve static assets.
 - Updated README with new description and usage instructions.

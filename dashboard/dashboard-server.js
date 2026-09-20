@@ -320,7 +320,7 @@ const server = http.createServer(async (req, res) => {
       const r1 = sysctl("zen-rotator.service", "restart");
       const r2 = sysctl("opencode-serve.service", "restart");
       const r3 = sysctl("zen-bridge.service", "restart");
-      return sendJson(res, 200, { ok: r1.ok && r2.ok && r3.ok, msg: "All loophole services restarted (zen only, no g4f)" });
+      return sendJson(res, 200, { ok: r1.ok && r2.ok && r3.ok, msg: "All loophole services restarted (zen only)" });
     }
     if (p === "/api/test-chain" && req.method === "POST") {
       let body = "";
