@@ -360,6 +360,36 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Proxy /v1/models to the bridge so the UI can list all free models
+    if ((p === "/v1/models" || p === "/models") && req.method === "GET") {
+      const bridgeRes = await httpGet("http://127.0.0.1:1343/v1/models", 3000);
+      if (bridgeRes.status === 200 && bridgeRes.json) {
+        return sendJson(res, 200, bridgeRes.json);
+      }
+      // Fallback: read catalog directly
+      const catalogPath = (() => {
+        const candidates = [
+          path.join(HOME, ".local", "share", "opencode", "servehome", ".local", "share", "opencode", "models-catalog.json"),
+          path.join(HOME, ".local", "share", "opencode", "models-catalog.json"),
+          path.join(__dirname, "..", "models-catalog.json"),
+          path.join(__dirname, "..", "config", "models-catalog.json"),
+        ];
+        for (const c of candidates) { if (fs.existsSync(c)) return c; }
+        return null;
+      })();
+      if (catalogPath) {
+        const cat = JSON.parse(fs.readFileSync(catalogPath, "utf8"));
+        const whitelist = cat.whitelist_31 || [];
+        const data = [
+          { id: "opencode/fast", object: "model", created: 0, owned_by: "opencode" },
+          { id: "opencode/fastest", object: "model", created: 0, owned_by: "opencode" },
+          ...whitelist.map(id => ({ id: "opencode/" + id, object: "model", created: 0, owned_by: "opencode" })),
+        ];
+        return sendJson(res, 200, { object: "list", data });
+      }
+      return sendJson(res, 503, { ok: false, error: "bridge unreachable and no catalog found" });
+    }
+
     sendJson(res, 404, { ok: false, error: "not found" });
   } catch (e) {
     sendJson(res, 500, { ok: false, error: e.message });

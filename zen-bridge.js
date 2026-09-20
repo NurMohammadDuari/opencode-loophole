@@ -164,8 +164,22 @@ function callServe(method, reqPath, body, timeoutMs = ZEN_TIMEOUT_MS) {
   });
 }
 
-function callG4f(body) {
-  const payload = { ...body, model: G4F_FAST_MODEL, provider: "Gemini", stream: false };
+// Confirmed-working g4f models (tested 2026-09-20). Tried in order; first success wins.
+const G4F_WORKING_MODELS = process.env.G4F_WORKING_MODELS
+  ? process.env.G4F_WORKING_MODELS.split(",")
+  : [
+      "gemini-flash-lite",       // fastest, most reliable
+      "gemini-2.0-flash",        // good quality
+      "gemini-2.5-flash",        // best Gemini free
+      "gemini-2.5-pro",          // premium quality
+      "gemini-2.0-flash-thinking", // reasoning
+      "command-r-plus",          // Cohere
+      "qwen-2.5-coder-32b",      // code-focused
+    ];
+
+function callG4f(body, modelOverride) {
+  const model = modelOverride || G4F_FAST_MODEL;
+  const payload = { ...body, model, provider: "Gemini", stream: false };
   return httpJson(g4fAgent, G4F_HOST, G4F_PORT, "POST", "/v1/chat/completions", payload, G4F_TIMEOUT_MS);
 }
 
@@ -476,19 +490,22 @@ async function zenOnce(model, body) {
 }
 
 async function g4fOnce(body) {
-  const g4fRes = await callG4f(body);
-  if (g4fRes.status !== 200 || !g4fRes.json || !g4fRes.json.choices) {
-    throw Object.assign(new Error("g4f failed: " + g4fRes.status + " " + (g4fRes.raw || "").slice(0, 200)), {
-      status: g4fRes.status || 502,
-    });
+  let lastErr = null;
+  for (const model of G4F_WORKING_MODELS) {
+    const g4fRes = await callG4f(body, model);
+    if (g4fRes.status === 200 && g4fRes.json && g4fRes.json.choices) {
+      writeProof({
+        path: "g4f-fallback",
+        model,
+        sample: ((((g4fRes.json.choices || [])[0] || {}).message || {}).content || "").slice(0, 160),
+        note: "zen path failed; used local g4f mirror model=" + model,
+      });
+      return { openaiRes: g4fRes.json, sessionID: "g4f", path: "g4f-fallback", model };
+    }
+    lastErr = "g4f/" + model + " failed: " + g4fRes.status + " " + (g4fRes.raw || "").slice(0, 80);
+    console.error("Zen Bridge: g4f model", model, "failed:", g4fRes.status);
   }
-  writeProof({
-    path: "g4f-fallback",
-    model: G4F_FAST_MODEL,
-    sample: ((((g4fRes.json.choices || [])[0] || {}).message || {}).content || "").slice(0, 160),
-    note: "zen path failed; used local g4f Gemini mirror",
-  });
-  return { openaiRes: g4fRes.json, sessionID: "g4f", path: "g4f-fallback" };
+  throw Object.assign(new Error("all g4f models failed; last: " + lastErr), { status: 502 });
 }
 
 async function handleChat(res, body, stream) {
@@ -602,6 +619,8 @@ const server = http.createServer((req, res) => {
       { id: "opencode/fast", object: "model", created: 0, owned_by: "opencode" },
       { id: "opencode/fastest", object: "model", created: 0, owned_by: "opencode" },
       ...WHITELIST.map((id) => ({ id: "opencode/" + id, object: "model", created: 0, owned_by: "opencode" })),
+      // Expose confirmed-working g4f fallback models under g4f/ prefix
+      ...G4F_WORKING_MODELS.map((id) => ({ id: "g4f/" + id, object: "model", created: 0, owned_by: "g4f" })),
     ];
     res.writeHead(200, { "Content-Type": "application/json", ...proofHeaders() });
     return res.end(JSON.stringify({ object: "list", data: models }));
