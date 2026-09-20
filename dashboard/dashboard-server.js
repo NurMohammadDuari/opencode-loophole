@@ -9,7 +9,20 @@ const { DatabaseSync } = require("node:sqlite");
 const PORT = Number(process.env.DASHBOARD_PORT || 1395);
 const HOME = os.homedir();
 const DB_PATH = process.env.OPENCODE_DB || path.join(HOME, ".local", "share", "opencode", "opencode.db");
-const ACTIVITY_LOG = process.env.BRIDGE_ACTIVITY_LOG || path.join(HOME, ".local", "share", "opencode", "bridge-activity.jsonl");
+// The bridge runs with HOME=servehome, so it writes to servehome's share dir.
+// Prefer that live path; fall back to the standard path if it doesn't exist.
+const _ACTIVITY_STANDARD = path.join(HOME, ".local", "share", "opencode", "bridge-activity.jsonl");
+const _ACTIVITY_SERVEHOME = path.join(HOME, ".local", "share", "opencode", "servehome", ".local", "share", "opencode", "bridge-activity.jsonl");
+function resolveActivityLog() {
+  if (process.env.BRIDGE_ACTIVITY_LOG) return process.env.BRIDGE_ACTIVITY_LOG;
+  // Return whichever file is newer (has the most recent writes)
+  try {
+    const s = fs.statSync(_ACTIVITY_SERVEHOME);
+    const t = fs.existsSync(_ACTIVITY_STANDARD) ? fs.statSync(_ACTIVITY_STANDARD).mtimeMs : 0;
+    return s.mtimeMs >= t ? _ACTIVITY_SERVEHOME : _ACTIVITY_STANDARD;
+  } catch { return _ACTIVITY_STANDARD; }
+}
+const ACTIVITY_LOG = resolveActivityLog();
 
 const SERVICES = [
   { name: "bridge", label: "Zen Bridge", port: 1343, unit: "zen-bridge.service", healthUrl: "http://127.0.0.1:1343/health",
@@ -83,8 +96,9 @@ function unitLogs(unit, n = 200) {
 
 function readActivity(limit = 300) {
   try {
-    if (!fs.existsSync(ACTIVITY_LOG)) return [];
-    const raw = fs.readFileSync(ACTIVITY_LOG, "utf8");
+    const logPath = resolveActivityLog();
+    if (!fs.existsSync(logPath)) return [];
+    const raw = fs.readFileSync(logPath, "utf8");
     const lines = raw.split(/\r?\n/).filter(Boolean).slice(-limit);
     return lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
   } catch {
@@ -250,10 +264,8 @@ const server = http.createServer(async (req, res) => {
   const p = u.pathname;
 
   try {
-    // Serve static UI files — look next to this file first, then one level up
-    const PUBLIC_ROOT = fs.existsSync(path.join(__dirname, "public"))
-      ? path.join(__dirname, "public")
-      : path.resolve(__dirname, "..", "public");
+    // Serve static UI files from the shared public directory (one level up)
+    const PUBLIC_ROOT = path.resolve(__dirname, "..", "public");
     if (p === "/" || p === "/index.html") {
       const htmlPath = path.join(PUBLIC_ROOT, "index.html");
       const html = fs.readFileSync(htmlPath, "utf8");
@@ -331,13 +343,12 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, proof, rotatorProofs });
     }
     if (p === "/api/stream" && req.method === "GET") {
-      const share = path.join(os.homedir(), ".local", "share", "opencode");
-      const actPath = process.env.BRIDGE_ACTIVITY_LOG || path.join(share, "bridge-activity.jsonl");
       res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
       let closed = false;
       const interval = setInterval(() => {
         if (closed) { clearInterval(interval); return; }
         try {
+          const actPath = resolveActivityLog();
           if (!fs.existsSync(actPath)) { res.write("data: {}\n\n"); return; }
           const raw = fs.readFileSync(actPath, "utf8");
           const lines = raw.split(/\r?\n/).filter(Boolean).slice(-5);
