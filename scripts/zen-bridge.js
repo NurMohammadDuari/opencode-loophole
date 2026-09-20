@@ -1,35 +1,20 @@
 /**
  * Zen Bridge — REAL OpenAI-compat front door on :1343
  *
- * Not a simulation:
- *  - Creates a real opencode serve session
- *  - Streams live message.part.delta events from serve /event SSE
- *  - Serve talks to zen-rotator :1341 → real TLS to opencode.ai/zen/v1
- *  - Proof headers + /v1/proof expose last upstream hop evidence
+ * Pure zen path — no g4f fallback.
  *
- * FIXES (2026-09-20):
- *  - /v1/responses route added (OpenAI Responses API → chat completions bridge)
- *  - SSE "stream failed after headers sent" race fixed: finish(err) resolves
- *    instead of rejects when res.headersSent, so the outer .catch never fires
- *    a 500 response mid-stream
- *  - session.idle detection made more robust: also watches session.updated with
- *    completed time, guards all res.write calls with settled/headersSent checks
- *  - BLANK OUTPUT FIX v1: when zen stream times out with fullText="" (no content),
- *    the stream is NOT closed — instead emptyStream:true is returned and handleChat
- *    injects g4f fallback SSE chunks into the still-open stream before res.end().
- *    Previously the stream was closed with [DONE] and no text, causing blank output
- *    in the opencode CLI/app for any model that timed out on zen.
- *  - BLANK OUTPUT FIX v2 (2026-09-20 session 2): session.idle fires BEFORE
- *    message.part.delta events arrive (SSE race). flushAndFinish() and the isIdle
- *    handler in both zenStreamResponsesToClient and zenStreamToClient now check
- *    fullText==="" and treat that case as emptyStream (g4f fallback) instead of
- *    emitting blank content. This fixes blank output for ALL models, not just
- *    timed-out ones.
- *  - REMAP TIMEOUT FIX: non-live models now use ZEN_REMAP_TIMEOUT_MS (30s default)
- *    instead of ZEN_TIMEOUT_MS (150s) so g4f fallback kicks in quickly instead of
- *    making users wait 2.5 minutes for a blank response.
- *  - models-catalog.json updated: zen_live_free now contains only confirmed-working
- *    zen models; all others remap to a confirmed live model.
+ * Flow: opencode client → bridge:1343 → opencode serve:18765 → rotator:1341 → opencode.ai/zen/v1
+ *
+ * When zen returns empty text (idle-before-delta race) or times out, the request
+ * fails with a proper error response instead of silently sending blank output.
+ *
+ * FIXES:
+ *  - /v1/responses route (OpenAI Responses API → full SSE event sequence)
+ *  - SSE "failed after headers sent" race: finish(err) resolves instead of rejects
+ *  - idle-before-delta blank output fix: flushAndFinish() + isIdle handler check
+ *    fullText==="" and close the stream with an error instead of blank content
+ *  - Non-live models use ZEN_REMAP_TIMEOUT_MS (30s) for faster failure
+ *  - models-catalog remap: non-working zen models route to a confirmed live model
  */
 const http = require("http");
 const crypto = require("crypto");
@@ -42,14 +27,10 @@ const SERVE_PORT = Number(process.env.SERVE_PORT || 18765);
 const SERVE_USER = process.env.SERVE_USER || "opencode";
 const SERVE_PASS = process.env.SERVE_PASS || "opencodepass";
 const PORT = process.env.BRIDGE_PORT ? Number(process.env.BRIDGE_PORT) : 1343;
-const G4F_HOST = process.env.G4F_HOST || "127.0.0.1";
-const G4F_PORT = Number(process.env.G4F_PORT || 1337);
-const G4F_FAST_MODEL = process.env.G4F_FAST_MODEL || "gemini-flash-lite";
-const FAST_RACE = process.env.FAST_RACE === "1"; // OFF by default — pure zen path
+const FAST_RACE = process.env.FAST_RACE === "1";
 const ZEN_TIMEOUT_MS = Number(process.env.ZEN_TIMEOUT_MS || 90000);
-// Shorter timeout for remapped (non-zen-live) models: if zen doesn't respond in 30s, fall through to g4f immediately
+// Shorter timeout for remapped (non-zen-live) models
 const ZEN_REMAP_TIMEOUT_MS = Number(process.env.ZEN_REMAP_TIMEOUT_MS || 30000);
-const G4F_TIMEOUT_MS = Number(process.env.G4F_TIMEOUT_MS || 30000);
 
 const SHARE = path.join(os.homedir(), ".local", "share", "opencode");
 const ACTIVITY_LOG = process.env.BRIDGE_ACTIVITY_LOG || path.join(SHARE, "bridge-activity.jsonl");
@@ -58,17 +39,15 @@ const ROTATOR_PROOF = process.env.ROTATOR_PROOF_FILE || path.join(SHARE, "rotato
 
 const AUTH = "Basic " + Buffer.from(`${SERVE_USER}:${SERVE_PASS}`).toString("base64");
 const serveAgent = new http.Agent({ keepAlive: true, maxSockets: 64, keepAliveMsecs: 30_000 });
-const g4fAgent = new http.Agent({ keepAlive: true, maxSockets: 16, keepAliveMsecs: 30_000 });
 
-// Try catalog from multiple locations so a missing servehome copy never silently falls back to big-pickle only
 const CATALOG_CANDIDATES = process.env.MODELS_CATALOG
   ? [process.env.MODELS_CATALOG]
   : [
-      path.join(SHARE, "models-catalog.json"),                                   // servehome path (bridge HOME)
-      path.join(os.homedir(), ".local", "share", "opencode", "models-catalog.json"), // real HOME
-      path.join(__dirname, "models-catalog.json"),                                // next to this file
-      path.join(__dirname, "..", "models-catalog.json"),                          // one level up
-      path.join(__dirname, "..", "config", "models-catalog.json"),                // config/ subdir
+      path.join(SHARE, "models-catalog.json"),
+      path.join(os.homedir(), ".local", "share", "opencode", "models-catalog.json"),
+      path.join(__dirname, "models-catalog.json"),
+      path.join(__dirname, "..", "models-catalog.json"),
+      path.join(__dirname, "..", "config", "models-catalog.json"),
     ];
 let CATALOG = { zen_live_free: ["big-pickle"], whitelist_31: ["big-pickle"], remap_to_zen_live: {} };
 let catalogLoaded = false;
@@ -80,47 +59,33 @@ for (const cp of CATALOG_CANDIDATES) {
     break;
   } catch {}
 }
-if (!catalogLoaded) console.error("catalog load failed — all candidate paths tried, using big-pickle fallback");
+if (!catalogLoaded) console.error("catalog load failed — using big-pickle fallback");
 
 const FAST_ZEN = new Set(CATALOG.zen_live_free || ["big-pickle"]);
 const MODEL_REMAP = CATALOG.remap_to_zen_live || {};
 const WHITELIST = CATALOG.whitelist_31 || ["big-pickle"];
 
-
 let lastProof = {
-  ts: 0,
-  real: true,
+  ts: 0, real: true,
   chain: ["opencode-client", "bridge:1343", "serve:18765", "rotator:1341", "opencode.ai/zen/v1"],
   note: "waiting for first request",
 };
 
 function logActivity(entry) {
-  try {
-    fs.appendFileSync(ACTIVITY_LOG, JSON.stringify({ ts: Date.now(), ...entry }) + "\n");
-  } catch {}
+  try { fs.appendFileSync(ACTIVITY_LOG, JSON.stringify({ ts: Date.now(), ...entry }) + "\n"); } catch {}
 }
 
 function writeProof(p) {
   lastProof = { ts: Date.now(), real: true, ...p };
-  try {
-    fs.writeFileSync(PROOF_FILE, JSON.stringify(lastProof, null, 2));
-  } catch {}
+  try { fs.writeFileSync(PROOF_FILE, JSON.stringify(lastProof, null, 2)); } catch {}
 }
 
 function readRotatorTail(n = 5) {
   try {
     if (!fs.existsSync(ROTATOR_PROOF)) return [];
     const lines = fs.readFileSync(ROTATOR_PROOF, "utf8").split(/\r?\n/).filter(Boolean).slice(-n);
-    return lines.map((l) => {
-      try {
-        return JSON.parse(l);
-      } catch {
-        return null;
-      }
-    }).filter(Boolean);
-  } catch {
-    return [];
-  }
+    return lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
 }
 
 function modelName(m) {
@@ -130,53 +95,39 @@ function modelName(m) {
 
 function resolveZenModel(m) {
   const raw = modelName(m);
-  if (FAST_ZEN.has(raw) || WHITELIST.includes(raw) || raw === "big-pickle") return { requested: raw, zenModel: raw, remapped: false };
+  if (FAST_ZEN.has(raw) || WHITELIST.includes(raw) || raw === "big-pickle")
+    return { requested: raw, zenModel: raw, remapped: false };
   if (MODEL_REMAP[raw]) return { requested: raw, zenModel: MODEL_REMAP[raw], remapped: true };
-  return { requested: raw, zenModel: MODEL_REMAP[raw] || "big-pickle", remapped: !!MODEL_REMAP[raw] || raw !== "big-pickle" };
+  return { requested: raw, zenModel: "big-pickle", remapped: true };
 }
 
 function messageText(m) {
   if (m == null) return "";
   if (typeof m.content === "string") return m.content;
-  if (Array.isArray(m.content)) {
-    return m.content
-      .map((p) => (typeof p === "string" ? p : (p && (p.text || p.content)) || ""))
-      .join("");
-  }
+  if (Array.isArray(m.content))
+    return m.content.map((p) => (typeof p === "string" ? p : (p && (p.text || p.content)) || "")).join("");
   return String(m.content || "");
 }
 
 function httpJson(agent, hostname, port, method, reqPath, body, timeoutMs, headers = {}) {
   return new Promise((resolve, reject) => {
     const data = body != null ? JSON.stringify(body) : null;
-    const req = http.request(
-      {
-        agent,
-        hostname,
-        port,
-        path: reqPath,
-        method,
-        headers: {
-          "content-type": "application/json",
-          ...(data ? { "content-length": Buffer.byteLength(data) } : {}),
-          ...headers,
-        },
-        timeout: timeoutMs,
+    const req = http.request({
+      agent, hostname, port, path: reqPath, method,
+      headers: {
+        "content-type": "application/json",
+        ...(data ? { "content-length": Buffer.byteLength(data) } : {}),
+        ...headers,
       },
-      (res) => {
-        let out = "";
-        res.on("data", (c) => {
-          out += c;
-        });
-        res.on("end", () => {
-          try {
-            resolve({ status: res.statusCode, json: out ? JSON.parse(out) : null, raw: out });
-          } catch {
-            resolve({ status: res.statusCode, json: { raw: out }, raw: out });
-          }
-        });
-      }
-    );
+      timeout: timeoutMs,
+    }, (res) => {
+      let out = "";
+      res.on("data", (c) => { out += c; });
+      res.on("end", () => {
+        try { resolve({ status: res.statusCode, json: out ? JSON.parse(out) : null, raw: out }); }
+        catch { resolve({ status: res.statusCode, json: { raw: out }, raw: out }); }
+      });
+    });
     req.on("timeout", () => req.destroy(new Error("timeout " + timeoutMs + "ms")));
     req.on("error", reject);
     if (data) req.write(data);
@@ -190,25 +141,6 @@ function callServe(method, reqPath, body, timeoutMs = ZEN_TIMEOUT_MS) {
   });
 }
 
-// Confirmed-working g4f models (tested 2026-09-20). Tried in order; first success wins.
-const G4F_WORKING_MODELS = process.env.G4F_WORKING_MODELS
-  ? process.env.G4F_WORKING_MODELS.split(",")
-  : [
-      "gemini-flash-lite",       // fastest, most reliable
-      "gemini-2.0-flash",        // good quality
-      "gemini-2.5-flash",        // best Gemini free
-      "gemini-2.5-pro",          // premium quality
-      "gemini-2.0-flash-thinking", // reasoning
-      "command-r-plus",          // Cohere
-      "qwen-2.5-coder-32b",      // code-focused
-    ];
-
-function callG4f(body, modelOverride) {
-  const model = modelOverride || G4F_FAST_MODEL;
-  const payload = { ...body, model, provider: "Gemini", stream: false };
-  return httpJson(g4fAgent, G4F_HOST, G4F_PORT, "POST", "/v1/chat/completions", payload, G4F_TIMEOUT_MS);
-}
-
 function proofHeaders(extra = {}) {
   return {
     "x-loophole-real": "1",
@@ -218,18 +150,9 @@ function proofHeaders(extra = {}) {
   };
 }
 
-/**
- * Convert OpenAI Responses API body (/v1/responses) to chat completions body.
- *
- * The Responses API uses:
- *   { model, input: "string" | [{type:"message",role,content}...], stream, ... }
- * We map it to:
- *   { model, messages: [{role, content}...], stream }
- */
 function responsesBodyToChatBody(body) {
   const input = body.input;
   let messages = [];
-
   if (typeof input === "string") {
     messages = [{ role: "user", content: input }];
   } else if (Array.isArray(input)) {
@@ -237,16 +160,9 @@ function responsesBodyToChatBody(body) {
       if (item && item.type === "message") {
         const role = item.role || "user";
         let content = "";
-        if (typeof item.content === "string") {
-          content = item.content;
-        } else if (Array.isArray(item.content)) {
-          content = item.content
-            .map((c) => {
-              if (typeof c === "string") return c;
-              return c.text || c.content || "";
-            })
-            .join("");
-        }
+        if (typeof item.content === "string") content = item.content;
+        else if (Array.isArray(item.content))
+          content = item.content.map((c) => (typeof c === "string" ? c : c.text || c.content || "")).join("");
         return { role, content };
       }
       return { role: "user", content: typeof item === "string" ? item : JSON.stringify(item) };
@@ -254,11 +170,8 @@ function responsesBodyToChatBody(body) {
   } else {
     messages = [{ role: "user", content: "" }];
   }
-
-  if (body.instructions && typeof body.instructions === "string") {
+  if (body.instructions && typeof body.instructions === "string")
     messages = [{ role: "system", content: body.instructions }, ...messages];
-  }
-
   return {
     model: body.model || "big-pickle",
     messages,
@@ -268,22 +181,7 @@ function responsesBodyToChatBody(body) {
   };
 }
 
-/**
- * Emit proper OpenAI Responses API SSE events.
- *
- * The Vercel AI SDK @ai-sdk/openai provider uses /v1/responses and expects
- * this exact SSE event schema — NOT chat.completion.chunk objects.
- *
- * Event sequence:
- *   response.created
- *   response.output_item.added        (the assistant message item)
- *   response.content_part.added       (the text part)
- *   response.output_text.delta        (repeated for each text chunk)
- *   response.output_text.done
- *   response.content_part.done
- *   response.output_item.done
- *   response.completed
- */
+// ── Responses API SSE streaming ──────────────────────────────────────────────
 function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
   timeoutMs = timeoutMs || ZEN_TIMEOUT_MS;
   return new Promise(async (resolve, reject) => {
@@ -302,11 +200,6 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
       try { res.write("event: " + obj.type + "\ndata: " + JSON.stringify({ sequence_number: seq(), ...obj }) + "\n\n"); } catch {}
     };
 
-    // FIX: delay session deletion 2s — gives the opencode client time to finish
-    // processing the completed response before the session disappears.
-    // Immediate deletion caused "Session not found" and blank output in opencode UI.
-    // FIX 2: when stream timeout fires with fullText=="" (blank output), resolve with
-    // emptyStream:true WITHOUT closing res so caller can inject g4f fallback content.
     const finish = (err) => {
       if (settled) return;
       settled = true;
@@ -316,18 +209,22 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
       }, 2000);
       if (err) {
         if (res.headersSent) {
-          // If we got NO text at all — return emptyStream:true without closing res
-          // so the /v1/responses handler can inject g4f fallback events.
           if (fullText === "") {
-            resolve({ sessionID, text: "", tokens, ms: Date.now() - t0, path: "zen-responses-empty", streamErr: err.message, emptyStream: true, respId, itemId, created });
+            // Blank output: close stream with error event instead of empty text
+            try {
+              safeWrite({ type: "response.output_text.delta", item_id: itemId, output_index: 0, content_index: 0, delta: "[zen: no response — model may be unavailable, try big-pickle or muse-spark-1.3-contributor-free]" });
+              safeWrite({ type: "response.output_text.done", item_id: itemId, output_index: 0, content_index: 0, text: "[zen: no response]" });
+              safeWrite({ type: "response.content_part.done", item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: "[zen: no response]", annotations: [] } });
+              safeWrite({ type: "response.output_item.done", output_index: 0, item: { type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text: "[zen: no response]", annotations: [] }], status: "completed" } });
+              safeWrite({ type: "response.completed", response: buildResponseObj(respId, model, created, "[zen: no response]", tokens, "completed") });
+              res.write("data: [DONE]\n\n");
+              res.end();
+            } catch {}
+            resolve({ sessionID, text: "", tokens, ms: Date.now() - t0, path: "zen-responses-notext", streamErr: err.message });
             return;
           }
-          // Has partial content — close gracefully
           try {
-            safeWrite({
-              type: "response.completed",
-              response: buildResponseObj(respId, model, created, fullText, tokens, "incomplete"),
-            });
+            safeWrite({ type: "response.completed", response: buildResponseObj(respId, model, created, fullText, tokens, "incomplete") });
             res.write("data: [DONE]\n\n");
             res.end();
           } catch {}
@@ -346,62 +243,31 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
     function buildResponseObj(id, mdl, ts, text, tok, status) {
       const isInProgress = status === "in_progress";
       return {
-        id,
-        object: "response",
-        created_at: ts,
-        model: mdl,
-        status: status || "completed",
+        id, object: "response", created_at: ts, model: mdl, status: status || "completed",
         output: isInProgress ? [] : [{
-          type: "message",
-          id: itemId,
-          role: "assistant",
-          content: [{ type: "output_text", text, annotations: [] }],
-          status: "completed",
+          type: "message", id: itemId, role: "assistant",
+          content: [{ type: "output_text", text, annotations: [] }], status: "completed",
         }],
-        usage: tok ? {
-          input_tokens: tok.input || tok.prompt || 0,
-          output_tokens: tok.output || tok.completion || 0,
-          total_tokens: tok.total || 0,
-        } : { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+        usage: tok
+          ? { input_tokens: tok.input || tok.prompt || 0, output_tokens: tok.output || tok.completion || 0, total_tokens: tok.total || 0 }
+          : { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
       };
     }
 
     try {
       const session = await callServe("POST", "/session", { directory: null }, 15000);
-      if (session.status !== 200 || !session.json || !session.json.id) {
+      if (session.status !== 200 || !session.json || !session.json.id)
         throw new Error("serve session failed: " + session.status);
-      }
       sessionID = session.json.id;
 
       res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-        ...proofHeaders({
-          "x-loophole-path": "zen-responses",
-          "x-loophole-session": sessionID,
-          "x-loophole-model": model,
-        }),
+        "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive",
+        ...proofHeaders({ "x-loophole-path": "zen-responses", "x-loophole-session": sessionID, "x-loophole-model": model }),
       });
 
-      // 1. response.created
       safeWrite({ type: "response.created", response: buildResponseObj(respId, model, created, "", null, "in_progress") });
-
-      // 2. output_item.added
-      safeWrite({
-        type: "response.output_item.added",
-        output_index: 0,
-        item: { type: "message", id: itemId, role: "assistant", content: [], status: "in_progress" },
-      });
-
-      // 3. content_part.added
-      safeWrite({
-        type: "response.content_part.added",
-        item_id: itemId,
-        output_index: 0,
-        content_index: 0,
-        part: { type: "output_text", text: "", annotations: [] },
-      });
+      safeWrite({ type: "response.output_item.added", output_index: 0, item: { type: "message", id: itemId, role: "assistant", content: [], status: "in_progress" } });
+      safeWrite({ type: "response.content_part.added", item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
 
       const timer = setTimeout(() => finish(new Error("zen responses stream timeout")), timeoutMs);
 
@@ -409,26 +275,16 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
       const stallCheck = setInterval(() => {
         if (settled) { clearInterval(stallCheck); return; }
         if (fullText.length > 0 && Date.now() - lastDeltaAt > 15000) {
-          clearInterval(stallCheck);
-          clearTimeout(timer);
-          flushAndFinish();
+          clearInterval(stallCheck); clearTimeout(timer); flushAndFinish();
         }
       }, 2000);
 
       function flushAndFinish() {
         if (settled) return;
-        // BLANK OUTPUT FIX: if session went idle but we received zero text, the deltas
-        // haven't arrived yet (race condition: idle fires before message.part.delta over SSE).
-        // Treat it as emptyStream so the /v1/responses handler can inject g4f fallback content.
+        // Idle fired before deltas arrived — send error instead of blank
         if (fullText === "") {
-          console.error("Zen Bridge: idle fired with empty text for", model, "-> emptyStream (will inject g4f)");
-          // Mark settled manually so finish() guard works correctly
-          settled = true;
-          if (sub) sub.close();
-          setTimeout(() => {
-            if (sessionID) callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {});
-          }, 2000);
-          resolve({ sessionID, text: "", tokens, ms: Date.now() - t0, path: "zen-responses-empty", streamErr: "idle-with-no-text", emptyStream: true, respId, itemId, created });
+          console.error("Zen Bridge: idle-before-delta for", model, "— closing with error");
+          finish(new Error("idle-with-no-text"));
           return;
         }
         try {
@@ -451,10 +307,7 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
 
         if (type === "message.updated") {
           const info = props.info || {};
-          if (info.role === "assistant" && info.id) {
-            assistantMsgId = info.id;
-            if (info.tokens) tokens = info.tokens;
-          }
+          if (info.role === "assistant" && info.id) { assistantMsgId = info.id; if (info.tokens) tokens = info.tokens; }
         }
 
         if (type === "message.part.delta") {
@@ -465,14 +318,7 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
           if (!assistantMsgId && props.messageID) assistantMsgId = props.messageID;
           fullText += delta;
           lastDeltaAt = Date.now();
-          // Emit proper Responses API delta event
-          safeWrite({
-            type: "response.output_text.delta",
-            item_id: itemId,
-            output_index: 0,
-            content_index: 0,
-            delta,
-          });
+          safeWrite({ type: "response.output_text.delta", item_id: itemId, output_index: 0, content_index: 0, delta });
         }
 
         const isIdle =
@@ -480,37 +326,22 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
           (type === "session.status" && props.status && props.status.type === "idle") ||
           (type === "session.updated" && props.session && props.session.time && props.session.time.completed);
 
-        if (isIdle) {
-          clearTimeout(timer);
-          clearInterval(stallCheck);
-          flushAndFinish();
-        }
+        if (isIdle) { clearTimeout(timer); clearInterval(stallCheck); flushAndFinish(); }
       });
 
       await new Promise((r) => setTimeout(r, 80));
-      const prompt = await callServe(
-        "POST",
-        `/session/${sessionID}/prompt_async`,
-        {
-          model: { providerID: "opencode", modelID: model },
-          parts: buildParts(chatBody),
-        },
-        15000
-      );
+      const prompt = await callServe("POST", `/session/${sessionID}/prompt_async`, {
+        model: { providerID: "opencode", modelID: model },
+        parts: buildParts(chatBody),
+      }, 15000);
       if (prompt.status !== 204 && prompt.status !== 200) {
-        clearTimeout(timer);
-        clearInterval(stallCheck);
+        clearTimeout(timer); clearInterval(stallCheck);
         throw new Error("prompt_async failed: " + prompt.status + " " + (prompt.raw || "").slice(0, 200));
       }
-    } catch (e) {
-      finish(e);
-    }
+    } catch (e) { finish(e); }
   });
 }
 
-/**
- * Non-streaming Responses API: collect full text then return a proper Response object.
- */
 async function zenResponsesOnce(model, chatBody) {
   const { openaiRes, sessionID, path: p } = await zenOnce(model, chatBody);
   const text = (((openaiRes.choices || [])[0] || {}).message || {}).content || "";
@@ -520,34 +351,15 @@ async function zenResponsesOnce(model, chatBody) {
   const tok = openaiRes.usage;
   return {
     responsesObj: {
-      id: respId,
-      object: "response",
-      created_at: created,
-      model,
-      status: "completed",
-      output: [{
-        type: "message",
-        id: itemId,
-        role: "assistant",
-        content: [{ type: "output_text", text, annotations: [] }],
-        status: "completed",
-      }],
-      usage: tok ? {
-        input_tokens: tok.prompt_tokens || 0,
-        output_tokens: tok.completion_tokens || 0,
-        total_tokens: tok.total_tokens || 0,
-      } : { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+      id: respId, object: "response", created_at: created, model, status: "completed",
+      output: [{ type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text, annotations: [] }], status: "completed" }],
+      usage: tok ? { input_tokens: tok.prompt_tokens || 0, output_tokens: tok.completion_tokens || 0, total_tokens: tok.total_tokens || 0 } : { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
     },
-    sessionID,
-    path: p,
-    text,
+    sessionID, path: p, text,
   };
 }
 
-/**
- * Subscribe to serve /event SSE and invoke onEvent(parsed) for each data line.
- * Reconnects automatically on disconnect. Returns { close() }.
- */
+// ── serve /event SSE subscriber ──────────────────────────────────────────────
 function subscribeEvents(onEvent) {
   let closed = false;
   let currentReq = null;
@@ -555,88 +367,46 @@ function subscribeEvents(onEvent) {
   function connect() {
     if (closed) return;
     let buf = "";
-    // Use a fresh per-connection agent (NOT keepAlive) so we always get a full SSE stream
     const sseAgent = new http.Agent({ keepAlive: false });
-    const req = http.request(
-      {
-        agent: sseAgent,
-        hostname: SERVE_HOST,
-        port: SERVE_PORT,
-        path: "/event",
-        method: "GET",
-        headers: {
-          authorization: AUTH,
-          accept: "text/event-stream",
-          connection: "keep-alive",
-          "cache-control": "no-cache",
-        },
-      },
-      (res) => {
-        res.on("data", (chunk) => {
-          if (closed) return;
-          buf += chunk.toString("utf8");
-          let idx;
-          while ((idx = buf.indexOf("\n\n")) !== -1) {
-            const block = buf.slice(0, idx);
-            buf = buf.slice(idx + 2);
-            const lines = block.split(/\r?\n/);
-            for (const line of lines) {
-              if (!line.startsWith("data:")) continue;
-              const raw = line.slice(5).trim();
-              if (!raw || raw === "[DONE]") continue;
-              try {
-                onEvent(JSON.parse(raw));
-              } catch {}
-            }
+    const req = http.request({
+      agent: sseAgent, hostname: SERVE_HOST, port: SERVE_PORT, path: "/event", method: "GET",
+      headers: { authorization: AUTH, accept: "text/event-stream", connection: "keep-alive", "cache-control": "no-cache" },
+    }, (res) => {
+      res.on("data", (chunk) => {
+        if (closed) return;
+        buf += chunk.toString("utf8");
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          for (const line of block.split(/\r?\n/)) {
+            if (!line.startsWith("data:")) continue;
+            const raw = line.slice(5).trim();
+            if (!raw || raw === "[DONE]") continue;
+            try { onEvent(JSON.parse(raw)); } catch {}
           }
-        });
-        res.on("end", () => {
-          if (!closed) {
-            // Reconnect after brief delay
-            setTimeout(connect, 200);
-          }
-        });
-        res.on("error", () => {
-          if (!closed) setTimeout(connect, 500);
-        });
-      }
-    );
-    req.on("error", () => {
-      if (!closed) setTimeout(connect, 500);
+        }
+      });
+      res.on("end", () => { if (!closed) setTimeout(connect, 200); });
+      res.on("error", () => { if (!closed) setTimeout(connect, 500); });
     });
+    req.on("error", () => { if (!closed) setTimeout(connect, 500); });
     req.end();
     currentReq = req;
   }
 
   connect();
-
-  return {
-    close() {
-      closed = true;
-      try {
-        if (currentReq) currentReq.destroy();
-      } catch {}
-    },
-  };
+  return { close() { closed = true; try { if (currentReq) currentReq.destroy(); } catch {} } };
 }
 
 function buildParts(body) {
   return (body.messages || []).map((m) => ({
-    type: "text",
-    text: messageText(m),
+    type: "text", text: messageText(m),
     id: "prt_" + crypto.randomBytes(12).toString("hex"),
   }));
 }
 
-/**
- * REAL streaming: prompt_async + live message.part.delta from serve events.
- *
- * FIX: "zen stream failed after headers sent"
- *   When the stream already started (res.headersSent), finish(err) now RESOLVES
- *   instead of rejecting. This prevents the outer handleChat .catch() from
- *   attempting to write a 500 JSON response after SSE headers were sent.
- *   The client already received partial content and a graceful [DONE].
- */
+// ── Chat completions SSE streaming ───────────────────────────────────────────
 function zenStreamToClient(res, model, body, timeoutMs) {
   timeoutMs = timeoutMs || ZEN_TIMEOUT_MS;
   return new Promise(async (resolve, reject) => {
@@ -649,36 +419,29 @@ function zenStreamToClient(res, model, body, timeoutMs) {
     let sub = null;
     const chatId = "chatcmpl-" + crypto.randomBytes(8).toString("hex");
 
-    // FIX: never reject after headers are sent — resolve with an error flag instead
-    // so the outer .catch doesn't try to write a new 5xx head mid-stream.
-    // FIX 2: when stream timeout fires with fullText=="" (blank output bug), do NOT
-    // call res.end() — instead resolve with emptyStream:true so handleChat can inject
-    // g4f fallback content into the still-open SSE stream before closing it.
     const finish = (err) => {
       if (settled) return;
       settled = true;
       if (sub) sub.close();
-      // Delay deletion 2s so opencode client can finish processing the response
-      setTimeout(() => {
-        if (sessionID) callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {});
-      }, 2000);
+      setTimeout(() => { if (sessionID) callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {}); }, 2000);
 
       if (err) {
         if (res.headersSent) {
-          // Stream already started but may have no content yet.
-          // If we got NO text at all, return emptyStream:true WITHOUT closing res
-          // so the caller can inject g4f fallback SSE chunks before res.end().
           if (fullText === "") {
-            resolve({ sessionID, text: "", tokens, ms: Date.now() - t0, path: "zen-stream-empty", streamErr: err.message, emptyStream: true, chatId });
+            // Idle-before-delta race: emit error content instead of blank
+            try {
+              res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: "[zen: no response — model may be unavailable, try big-pickle or muse-spark-1.3-contributor-free]" }, finish_reason: "stop" }] })}\n\n`);
+              res.write("data: [DONE]\n\n");
+              res.end();
+            } catch {}
+            resolve({ sessionID, text: "", tokens, ms: Date.now() - t0, path: "zen-stream-notext", streamErr: err.message, chatId });
             return;
           }
-          // Has partial content — close gracefully
           try {
             res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
             res.write("data: [DONE]\n\n");
             res.end();
           } catch {}
-          // Resolve (not reject) so the outer .catch never fires a 500 mid-stream
           resolve({ sessionID, text: fullText, tokens, ms: Date.now() - t0, path: "zen-stream-partial", streamErr: err.message });
         } else {
           reject(err);
@@ -690,43 +453,24 @@ function zenStreamToClient(res, model, body, timeoutMs) {
 
     try {
       const session = await callServe("POST", "/session", { directory: null }, 15000);
-      if (session.status !== 200 || !session.json || !session.json.id) {
+      if (session.status !== 200 || !session.json || !session.json.id)
         throw new Error("serve session failed: " + session.status);
-      }
       sessionID = session.json.id;
 
       res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-        ...proofHeaders({
-          "x-loophole-path": "zen-stream",
-          "x-loophole-session": sessionID,
-          "x-loophole-model": model,
-        }),
+        "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive",
+        ...proofHeaders({ "x-loophole-path": "zen-stream", "x-loophole-session": sessionID, "x-loophole-model": model }),
       });
 
-      // role chunk
-      res.write(
-        `data: ${JSON.stringify({
-          id: chatId,
-          object: "chat.completion.chunk",
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
-        })}\n\n`
-      );
+      res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n`);
 
       const timer = setTimeout(() => finish(new Error("zen stream timeout")), timeoutMs);
 
-      // Track how long since last delta to detect a stalled stream even without session.idle
       let lastDeltaAt = Date.now();
       const stallCheck = setInterval(() => {
         if (settled) { clearInterval(stallCheck); return; }
         if (fullText.length > 0 && Date.now() - lastDeltaAt > 15000) {
-          // No new content for 15s after first text — treat as done
-          clearInterval(stallCheck);
-          clearTimeout(timer);
+          clearInterval(stallCheck); clearTimeout(timer);
           if (!res.headersSent) return;
           try {
             res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
@@ -746,10 +490,7 @@ function zenStreamToClient(res, model, body, timeoutMs) {
 
         if (type === "message.updated") {
           const info = props.info || {};
-          if (info.role === "assistant" && info.id) {
-            assistantMsgId = info.id;
-            if (info.tokens) tokens = info.tokens;
-          }
+          if (info.role === "assistant" && info.id) { assistantMsgId = info.id; if (info.tokens) tokens = info.tokens; }
         }
 
         if (type === "message.part.delta") {
@@ -761,118 +502,63 @@ function zenStreamToClient(res, model, body, timeoutMs) {
           fullText += delta;
           lastDeltaAt = Date.now();
           try {
-            res.write(
-              `data: ${JSON.stringify({
-                id: chatId,
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
-                model,
-                choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
-              })}\n\n`
-            );
+            res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] })}\n\n`);
           } catch {}
         }
 
-        // FIX: more robust idle detection
-        // session.idle event, OR session.status with type=idle, OR session.updated with completed time
         const isIdle =
           type === "session.idle" ||
           (type === "session.status" && props.status && props.status.type === "idle") ||
           (type === "session.updated" && props.session && props.session.time && props.session.time.completed);
 
         if (isIdle) {
-          clearTimeout(timer);
-          clearInterval(stallCheck);
-          // BLANK OUTPUT FIX: idle fired before any delta events arrived (race condition).
-          // Resolve with emptyStream:true so handleChat can inject g4f fallback content.
+          clearTimeout(timer); clearInterval(stallCheck);
+          // Idle-before-delta race: error instead of blank
           if (fullText === "") {
-            console.error("Zen Bridge: idle fired with empty text for", model, "-> emptyStream (will inject g4f)");
+            console.error("Zen Bridge: idle-before-delta for", model, "— error response");
             finish(new Error("idle-with-no-text"));
             return;
           }
           try {
-            res.write(
-              `data: ${JSON.stringify({
-                id: chatId,
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
-                model,
-                choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-              })}\n\n`
-            );
+            res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
             res.write("data: [DONE]\n\n");
             res.end();
           } catch {}
-          writeProof({
-            path: "zen-stream",
-            sessionID,
-            model,
-            ms: Date.now() - t0,
-            chars: fullText.length,
-            tokens,
-            rotator: readRotatorTail(3),
-            sample: fullText.slice(0, 160),
-          });
+          writeProof({ path: "zen-stream", sessionID, model, ms: Date.now() - t0, chars: fullText.length, tokens, rotator: readRotatorTail(3), sample: fullText.slice(0, 160) });
           finish(null);
         }
       });
 
-      // kick the real async prompt after event subscription is live
       await new Promise((r) => setTimeout(r, 80));
-      const prompt = await callServe(
-        "POST",
-        `/session/${sessionID}/prompt_async`,
-        {
-          model: { providerID: "opencode", modelID: model },
-          parts: buildParts(body),
-        },
-        15000
-      );
+      const prompt = await callServe("POST", `/session/${sessionID}/prompt_async`, {
+        model: { providerID: "opencode", modelID: model },
+        parts: buildParts(body),
+      }, 15000);
       if (prompt.status !== 204 && prompt.status !== 200) {
-        clearTimeout(timer);
-        clearInterval(stallCheck);
+        clearTimeout(timer); clearInterval(stallCheck);
         throw new Error("prompt_async failed: " + prompt.status + " " + (prompt.raw || "").slice(0, 200));
       }
-    } catch (e) {
-      finish(e);
-    }
+    } catch (e) { finish(e); }
   });
 }
 
-/**
- * Non-stream: sync /message (still real serve → rotator → opencode.ai)
- */
+// ── Non-stream: sync /message ─────────────────────────────────────────────────
 async function zenOnce(model, body) {
   const session = await callServe("POST", "/session", { directory: null }, 15000);
-  if (session.status !== 200 || !session.json || !session.json.id) {
+  if (session.status !== 200 || !session.json || !session.json.id)
     throw Object.assign(new Error("serve session failed: " + session.status), { status: session.status });
-  }
   const sessionID = session.json.id;
   try {
-    const msg = await callServe(
-      "POST",
-      `/session/${sessionID}/message`,
-      {
-        model: { providerID: "opencode", modelID: model },
-        parts: buildParts(body),
-      },
-      ZEN_TIMEOUT_MS
-    );
-    if (msg.status !== 200) {
-      throw Object.assign(new Error("serve message failed: " + msg.status + " " + (msg.raw || "").slice(0, 200)), {
-        status: msg.status,
-      });
-    }
-    if (msg.json && msg.json.name === "UnknownError") {
-      throw Object.assign(new Error("serve UnknownError: " + ((msg.json.data && msg.json.data.message) || "")), {
-        status: 500,
-      });
-    }
-    if (msg.json && msg.json.info && msg.json.info.error) {
-      throw Object.assign(new Error("serve model error: " + JSON.stringify(msg.json.info.error).slice(0, 240)), {
-        status: 502,
-      });
-    }
+    const msg = await callServe("POST", `/session/${sessionID}/message`, {
+      model: { providerID: "opencode", modelID: model },
+      parts: buildParts(body),
+    }, ZEN_TIMEOUT_MS);
+    if (msg.status !== 200)
+      throw Object.assign(new Error("serve message failed: " + msg.status + " " + (msg.raw || "").slice(0, 200)), { status: msg.status });
+    if (msg.json && msg.json.name === "UnknownError")
+      throw Object.assign(new Error("serve UnknownError: " + ((msg.json.data && msg.json.data.message) || "")), { status: 500 });
+    if (msg.json && msg.json.info && msg.json.info.error)
+      throw Object.assign(new Error("serve model error: " + JSON.stringify(msg.json.info.error).slice(0, 240)), { status: 502 });
 
     const parts = [];
     const walk = (node) => {
@@ -885,210 +571,75 @@ async function zenOnce(model, body) {
     const text = parts.join("");
     const openaiRes = {
       id: "chatcmpl-" + (msg.json.info && msg.json.info.id ? msg.json.info.id : crypto.randomBytes(8).toString("hex")),
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model,
+      object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
       choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
-      usage:
-        msg.json.info && msg.json.info.tokens
-          ? {
-              prompt_tokens: msg.json.info.tokens.input || msg.json.info.tokens.prompt,
-              completion_tokens: msg.json.info.tokens.output || msg.json.info.tokens.completion,
-              total_tokens: msg.json.info.tokens.total,
-            }
-          : undefined,
+      usage: msg.json.info && msg.json.info.tokens
+        ? { prompt_tokens: msg.json.info.tokens.input || msg.json.info.tokens.prompt, completion_tokens: msg.json.info.tokens.output || msg.json.info.tokens.completion, total_tokens: msg.json.info.tokens.total }
+        : undefined,
       system_fingerprint: sessionID,
     };
-    writeProof({
-      path: "zen-sync",
-      sessionID,
-      model,
-      tokens: msg.json.info && msg.json.info.tokens,
-      rotator: readRotatorTail(3),
-      sample: text.slice(0, 160),
-    });
+    writeProof({ path: "zen-sync", sessionID, model, tokens: msg.json.info && msg.json.info.tokens, rotator: readRotatorTail(3), sample: text.slice(0, 160) });
     return { openaiRes, sessionID, path: "zen-sync" };
   } finally {
     callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {});
   }
 }
 
-async function g4fOnce(body) {
-  let lastErr = null;
-  for (const model of G4F_WORKING_MODELS) {
-    const g4fRes = await callG4f(body, model);
-    if (g4fRes.status === 200 && g4fRes.json && g4fRes.json.choices) {
-      writeProof({
-        path: "g4f-fallback",
-        model,
-        sample: ((((g4fRes.json.choices || [])[0] || {}).message || {}).content || "").slice(0, 160),
-        note: "zen path failed; used local g4f mirror model=" + model,
-      });
-      return { openaiRes: g4fRes.json, sessionID: "g4f", path: "g4f-fallback", model };
-    }
-    lastErr = "g4f/" + model + " failed: " + g4fRes.status + " " + (g4fRes.raw || "").slice(0, 80);
-    console.error("Zen Bridge: g4f model", model, "failed:", g4fRes.status);
-  }
-  throw Object.assign(new Error("all g4f models failed; last: " + lastErr), { status: 502 });
-}
-
+// ── handleChat ───────────────────────────────────────────────────────────────
 async function handleChat(res, body, stream) {
   const resolved = resolveZenModel(body.model);
   const requested = resolved.requested;
   let zenModel = resolved.zenModel;
   let remapped = resolved.remapped;
 
-  // Prefer exact requested id when it is a known live zen free model
-  if (FAST_ZEN.has(requested)) {
-    zenModel = requested;
-    remapped = false;
-  }
+  if (FAST_ZEN.has(requested)) { zenModel = requested; remapped = false; }
 
   const tryZen = async (model, tag, timeoutOverride) => {
     if (stream) {
       const meta = await zenStreamToClient(res, model, body, timeoutOverride);
-      // FIX: if zen returned an empty stream (timeout with no content), signal the caller
-      // to inject g4f fallback content via the still-open SSE stream.
-      if (meta.emptyStream) {
-        return { ...meta, path: meta.path || tag, model, requested, remapped: model !== requested };
-      }
       return { path: meta.path || tag, model, requested, remapped: model !== requested, ...meta };
     }
     const result = await zenOnce(model, body);
     res.writeHead(200, {
       "Content-Type": "application/json",
-      ...proofHeaders({
-        "x-loophole-path": tag,
-        "x-loophole-session": result.sessionID || "",
-        "x-loophole-model": model,
-        "x-loophole-requested": requested,
-        "x-loophole-remapped": model !== requested ? "1" : "0",
-      }),
+      ...proofHeaders({ "x-loophole-path": tag, "x-loophole-session": result.sessionID || "", "x-loophole-model": model, "x-loophole-requested": requested, "x-loophole-remapped": model !== requested ? "1" : "0" }),
     });
     res.end(JSON.stringify(result.openaiRes));
     return { path: tag, model, requested, remapped: model !== requested };
   };
 
-  // Helper: inject g4f text as SSE chunks into an already-started (but not closed) stream
-  const injectG4fStream = async (chatIdForStream) => {
-    try {
-      const g4fResult = await g4fOnce(body);
-      const text = ((((g4fResult.openaiRes.choices || [])[0] || {}).message || {}).content) || "";
-      const cid = chatIdForStream || ("chatcmpl-g4f-" + Date.now().toString(16));
-      try {
-        res.write(`data: ${JSON.stringify({ id: cid, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: requested, choices: [{ index: 0, delta: { content: text }, finish_reason: null }] })}\n\n`);
-        res.write(`data: ${JSON.stringify({ id: cid, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: requested, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
-        res.write("data: [DONE]\n\n");
-        res.end();
-      } catch {}
-      writeProof({ path: "g4f-stream-fallback", model: g4fResult.model, requested, sample: text.slice(0, 160), note: "zen returned empty; injected g4f into open SSE stream" });
-      return { path: "g4f-stream-fallback", model: g4fResult.model, requested, remapped };
-    } catch (e) {
-      // g4f also failed — close stream gracefully with an error message
-      try {
-        const cid = chatIdForStream || ("chatcmpl-err-" + Date.now().toString(16));
-        res.write(`data: ${JSON.stringify({ id: cid, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: requested, choices: [{ index: 0, delta: { content: "[Error: zen timed out and g4f fallback also failed]" }, finish_reason: "stop" }] })}\n\n`);
-        res.write("data: [DONE]\n\n");
-        res.end();
-      } catch {}
-      return { path: "g4f-stream-err", model: "none", requested, remapped, error: e.message };
-    }
-  };
+  try {
+    const zenTimeout = (remapped || !FAST_ZEN.has(requested)) ? ZEN_REMAP_TIMEOUT_MS : ZEN_TIMEOUT_MS;
+    const meta = await tryZen(requested, remapped ? "zen-remap" : "zen-live", zenTimeout);
+    return meta;
+  } catch (e1) {
+    if (stream && res.headersSent)
+      return { path: "zen-stream-partial", model: zenModel, requested, remapped, streamErr: e1.message };
 
-  // 1) exact requested on zen (even if not in live list — zen may still accept it)
-  if (!stream || true) {
-    try {
-      if (requested !== zenModel || FAST_ZEN.has(requested) || !remapped) {
-        try {
-          // Use shorter timeout for remapped (non-live) models so g4f fallback kicks in faster
-          const zenTimeout = (remapped || !FAST_ZEN.has(requested)) ? ZEN_REMAP_TIMEOUT_MS : ZEN_TIMEOUT_MS;
-          const meta = await tryZen(requested, remapped ? "zen-exact" : "zen-live", zenTimeout);
-          // FIX: zen returned empty stream — inject g4f fallback into the still-open stream
-          if (meta && meta.emptyStream) {
-            console.error("Zen Bridge: zen returned empty for", requested, "-> g4f stream fallback");
-            return await injectG4fStream(meta.chatId);
-          }
-          return meta;
-        } catch (e1) {
-          // If headers were already sent (stream partial), surface it so the activity log records it
-          if (stream && res.headersSent) {
-            return { path: "zen-stream-partial", model: zenModel, requested, remapped, streamErr: e1.message };
-          }
-          // 2) disclosed remap to a live zen free model
-          if (MODEL_REMAP[requested] && MODEL_REMAP[requested] !== requested) {
-            console.error("Zen Bridge: exact failed for", requested, "-> remap", MODEL_REMAP[requested], e1.message);
-            try {
-              const meta2 = await tryZen(MODEL_REMAP[requested], "zen-remap");
-              if (meta2 && meta2.emptyStream) {
-                console.error("Zen Bridge: remap zen also empty for", requested, "-> g4f stream fallback");
-                return await injectG4fStream(meta2.chatId);
-              }
-              return meta2;
-            } catch (e2) {
-              console.error("Zen Bridge: remap failed, g4f fallback:", e2.message);
-            }
-          } else if (zenModel !== requested) {
-            try {
-              const meta2 = await tryZen(zenModel, "zen-remap");
-              if (meta2 && meta2.emptyStream) {
-                console.error("Zen Bridge: remap zen also empty for", requested, "-> g4f stream fallback");
-                return await injectG4fStream(meta2.chatId);
-              }
-              return meta2;
-            } catch (e2) {
-              console.error("Zen Bridge: remap failed, g4f fallback:", e2.message);
-            }
-          } else {
-            console.error("Zen Bridge: zen failed, g4f fallback:", e1.message);
-          }
-        }
-      }
-    } catch (e) {
-      console.error("Zen Bridge: unexpected:", e.message);
-      if (stream && res.headersSent) {
-        return { path: "zen-stream-partial", model: zenModel, requested, remapped, streamErr: e.message };
+    // Try the remapped live model if different
+    if (zenModel !== requested) {
+      try {
+        console.error("Zen Bridge: exact failed for", requested, "-> remap", zenModel, e1.message);
+        return await tryZen(zenModel, "zen-remap");
+      } catch (e2) {
+        console.error("Zen Bridge: remap also failed:", e2.message);
+        if (stream && res.headersSent)
+          return { path: "zen-remap-partial", model: zenModel, requested, remapped, streamErr: e2.message };
       }
     }
-  }
 
-  // stream path already wrote headers on success; on failure close the stream gracefully
-  if (stream && res.headersSent) {
-    // Can't send new headers — emit an SSE error event and close cleanly
-    const errId = "chatcmpl-err-" + Date.now().toString(16);
-    try {
-      res.write(`data: ${JSON.stringify({ id: errId, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: requested, choices: [{ index: 0, delta: { content: "" }, finish_reason: "stop" }] })}\n\n`);
-      res.write("data: [DONE]\n\n");
-      res.end();
-    } catch {}
-    return { path: "zen-stream-err", model: zenModel, requested, remapped };
+    // Both paths failed — return error
+    const errMsg = "zen failed for " + requested + ": " + e1.message;
+    console.error("Zen Bridge:", errMsg);
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "application/json", ...proofHeaders() });
+      res.end(JSON.stringify({ error: { message: errMsg, type: "zen_error" } }));
+    }
+    return { path: "zen-error", model: zenModel, requested, remapped, error: errMsg };
   }
-
-  const result = await g4fOnce(body);
-  if (stream) {
-    // emit as synthetic SSE from full g4f text
-    const text = ((((result.openaiRes.choices || [])[0] || {}).message || {}).content) || "";
-    const chatId = "chatcmpl-g4f-" + Date.now().toString(16);
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-      ...proofHeaders({ "x-loophole-path": "g4f-fallback", "x-loophole-requested": requested }),
-    });
-    res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: requested, choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }] })}\n\n`);
-    res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: requested, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
-    res.write("data: [DONE]\n\n");
-    res.end();
-  } else {
-    res.writeHead(200, {
-      "Content-Type": "application/json",
-      ...proofHeaders({ "x-loophole-path": result.path, "x-loophole-requested": requested }),
-    });
-    res.end(JSON.stringify(result.openaiRes));
-  }
-  return { path: "g4f-fallback", model: zenModel, requested, remapped };
 }
 
-
+// ── HTTP server ───────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   res.on("error", () => {});
   const urlPath = (req.url || "/").split("?")[0];
@@ -1098,8 +649,6 @@ const server = http.createServer((req, res) => {
       { id: "opencode/fast", object: "model", created: 0, owned_by: "opencode" },
       { id: "opencode/fastest", object: "model", created: 0, owned_by: "opencode" },
       ...WHITELIST.map((id) => ({ id: "opencode/" + id, object: "model", created: 0, owned_by: "opencode" })),
-      // Expose confirmed-working g4f fallback models under g4f/ prefix
-      ...G4F_WORKING_MODELS.map((id) => ({ id: "g4f/" + id, object: "model", created: 0, owned_by: "g4f" })),
     ];
     res.writeHead(200, { "Content-Type": "application/json", ...proofHeaders() });
     return res.end(JSON.stringify({ object: "list", data: models }));
@@ -1107,55 +656,29 @@ const server = http.createServer((req, res) => {
 
   if (urlPath === "/health" || urlPath === "/v1/health") {
     res.writeHead(200, { "Content-Type": "application/json", ...proofHeaders() });
-    return res.end(
-      JSON.stringify({
-        ok: true,
-        real: true,
-        simulation: false,
-        service: "bridge",
-        uptime: process.uptime(),
-        fastRace: FAST_RACE,
-        streaming: "serve-/event-message.part.delta",
-        upstream: "opencode.ai/zen/v1 via rotator:1341",
-        g4fFastModel: G4F_FAST_MODEL,
-        defaultZen: "big-pickle",
-      })
-    );
+    return res.end(JSON.stringify({
+      ok: true, real: true, simulation: false, service: "bridge",
+      uptime: process.uptime(), fastRace: FAST_RACE,
+      streaming: "serve-/event-message.part.delta",
+      upstream: "opencode.ai/zen/v1 via rotator:1341",
+      defaultZen: "big-pickle",
+    }));
   }
 
   if (urlPath === "/v1/proof" || urlPath === "/proof") {
     res.writeHead(200, { "Content-Type": "application/json", ...proofHeaders() });
-    return res.end(
-      JSON.stringify({
-        ok: true,
-        real: true,
-        simulation: false,
-        last: lastProof,
-        rotatorRecent: readRotatorTail(10),
-        chain: lastProof.chain || [
-          "opencode-client",
-          "bridge:1343",
-          "serve:18765",
-          "rotator:1341",
-          "opencode.ai/zen/v1",
-        ],
-      })
-    );
+    return res.end(JSON.stringify({
+      ok: true, real: true, simulation: false, last: lastProof,
+      rotatorRecent: readRotatorTail(10),
+      chain: lastProof.chain || ["opencode-client", "bridge:1343", "serve:18765", "rotator:1341", "opencode.ai/zen/v1"],
+    }));
   }
 
   if (urlPath === "/activity" && req.method === "GET") {
     try {
       const raw = fs.existsSync(ACTIVITY_LOG) ? fs.readFileSync(ACTIVITY_LOG, "utf8") : "";
       const lines = raw.split(/\r?\n/).filter(Boolean).slice(-200);
-      const data = lines
-        .map((l) => {
-          try {
-            return JSON.parse(l);
-          } catch {
-            return null;
-          }
-        })
-        .filter(Boolean);
+      const data = lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ ok: true, entries: data }));
     } catch (e) {
@@ -1164,48 +687,22 @@ const server = http.createServer((req, res) => {
     }
   }
 
-  if (
-    (urlPath === "/v1/chat/completions" || urlPath === "/chat/completions" || urlPath === "/v1/messages") &&
-    req.method === "POST"
-  ) {
+  if ((urlPath === "/v1/chat/completions" || urlPath === "/chat/completions" || urlPath === "/v1/messages") && req.method === "POST") {
     let chunks = "";
     const started = Date.now();
-    req.on("data", (c) => {
-      chunks += c;
-    });
+    req.on("data", (c) => { chunks += c; });
     req.on("end", () => {
       let body = {};
-      try {
-        body = JSON.parse(chunks || "{}");
-      } catch {}
+      try { body = JSON.parse(chunks || "{}"); } catch {}
       const model = body.model || "big-pickle";
       const streamReq = !!body.stream;
       const t0 = Date.now();
       handleChat(res, body, streamReq)
         .then((meta) => {
-          logActivity({
-            event: "completion",
-            model,
-            resolved: meta && meta.model,
-            path: meta && meta.path,
-            stream: streamReq,
-            status: 200,
-            ms: Date.now() - t0,
-            reqMs: t0 - started,
-            real: true,
-          });
+          logActivity({ event: "completion", model, resolved: meta && meta.model, path: meta && meta.path, stream: streamReq, status: 200, ms: Date.now() - t0, reqMs: t0 - started, real: true });
         })
         .catch((e) => {
-          logActivity({
-            event: "completion",
-            model,
-            stream: streamReq,
-            status: e.status || 500,
-            ms: Date.now() - t0,
-            reqMs: t0 - started,
-            error: e.message,
-            real: true,
-          });
+          logActivity({ event: "completion", model, stream: streamReq, status: e.status || 500, ms: Date.now() - t0, reqMs: t0 - started, error: e.message, real: true });
           if (!res.headersSent) {
             res.writeHead(e.status || 500, { "Content-Type": "application/json", ...proofHeaders() });
             res.end(JSON.stringify({ error: { message: "bridge: " + e.message } }));
@@ -1216,11 +713,6 @@ const server = http.createServer((req, res) => {
   }
 
   // ── /v1/responses — OpenAI Responses API ──────────────────────────────────
-  // The Vercel AI SDK @ai-sdk/openai provider (used by opencode internally)
-  // calls POST /v1/responses instead of /v1/chat/completions.
-  // We return proper Responses API SSE events (response.output_text.delta etc.)
-  // so the SDK does NOT throw "Received a Chat Completions stream while using
-  // the OpenAI Responses API".
   if (urlPath === "/v1/responses" && req.method === "POST") {
     let chunks = "";
     const started = Date.now();
@@ -1228,8 +720,6 @@ const server = http.createServer((req, res) => {
     req.on("end", () => {
       let rawBody = {};
       try { rawBody = JSON.parse(chunks || "{}"); } catch {}
-
-      // Convert Responses API body → chat completions body for internal use
       const chatBody = responsesBodyToChatBody(rawBody);
       const model = chatBody.model || "big-pickle";
       const streamReq = !!rawBody.stream;
@@ -1239,117 +729,59 @@ const server = http.createServer((req, res) => {
       const zenModel = FAST_ZEN.has(resolved.requested) ? resolved.requested : resolved.zenModel;
 
       const doRequest = async () => {
-        // Try zen path first
         const tryZenResponses = async (mdl, timeoutOverride) => {
-          if (streamReq) {
-            return await zenStreamResponsesToClient(res, mdl, chatBody, timeoutOverride);
-          }
+          if (streamReq) return await zenStreamResponsesToClient(res, mdl, chatBody, timeoutOverride);
           const result = await zenResponsesOnce(mdl, chatBody);
-          res.writeHead(200, {
-            "Content-Type": "application/json",
-            ...proofHeaders({ "x-loophole-path": result.path, "x-loophole-model": mdl }),
-          });
+          res.writeHead(200, { "Content-Type": "application/json", ...proofHeaders({ "x-loophole-path": result.path, "x-loophole-model": mdl }) });
           res.end(JSON.stringify(result.responsesObj));
           return result;
         };
 
-        // Helper: inject g4f fallback as Responses API SSE events into already-started stream
-        const injectG4fResponsesStream = async (existingRespId, existingItemId, existingCreated) => {
-          const rid = existingRespId || ("resp_g4f_" + Date.now().toString(16));
-          const iid = existingItemId || ("item_g4f_" + Date.now().toString(16));
-          const ts  = existingCreated || Math.floor(Date.now() / 1000);
-          try {
-            const g4fResult = await g4fOnce(chatBody);
-            const text = ((((g4fResult.openaiRes.choices || [])[0] || {}).message || {}).content) || "";
-            const responsesObj = {
-              id: rid, object: "response", created_at: ts, model, status: "completed",
-              output: [{ type: "message", id: iid, role: "assistant", content: [{ type: "output_text", text, annotations: [] }], status: "completed" }],
-              usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
-            };
-            const sw = (obj) => { try { res.write("event: " + obj.type + "\ndata: " + JSON.stringify(obj) + "\n\n"); } catch {} };
-            const seqBase = 10; // safe sequence number after the 3 opening events already sent
-            sw({ type: "response.output_text.delta", sequence_number: seqBase, item_id: iid, output_index: 0, content_index: 0, delta: text });
-            sw({ type: "response.output_text.done", sequence_number: seqBase + 1, item_id: iid, output_index: 0, content_index: 0, text });
-            sw({ type: "response.content_part.done", sequence_number: seqBase + 2, item_id: iid, output_index: 0, content_index: 0, part: { type: "output_text", text, annotations: [] } });
-            sw({ type: "response.output_item.done", sequence_number: seqBase + 3, output_index: 0, item: { type: "message", id: iid, role: "assistant", content: [{ type: "output_text", text, annotations: [] }], status: "completed" } });
-            sw({ type: "response.completed", sequence_number: seqBase + 4, response: responsesObj });
-            try { res.write("data: [DONE]\n\n"); res.end(); } catch {}
-            writeProof({ path: "g4f-responses-stream-fallback", model: g4fResult.model, sample: text.slice(0, 160), note: "zen responses empty; injected g4f into open SSE stream" });
-            return { path: "g4f-responses-stream-fallback", model: g4fResult.model };
-          } catch (e) {
-            // g4f also failed — emit error message and close
-            try {
-              const sw = (obj) => { try { res.write("event: " + obj.type + "\ndata: " + JSON.stringify(obj) + "\n\n"); } catch {} };
-              const errText = "[Error: zen timed out and g4f fallback also failed]";
-              sw({ type: "response.output_text.delta", sequence_number: 10, item_id: iid, output_index: 0, content_index: 0, delta: errText });
-              sw({ type: "response.output_text.done", sequence_number: 11, item_id: iid, output_index: 0, content_index: 0, text: errText });
-              sw({ type: "response.completed", sequence_number: 12, response: { id: rid, object: "response", created_at: ts, model, status: "completed", output: [{ type: "message", id: iid, role: "assistant", content: [{ type: "output_text", text: errText, annotations: [] }], status: "completed" }], usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } } });
-              res.write("data: [DONE]\n\n"); res.end();
-            } catch {}
-            return { path: "g4f-responses-stream-err", model: "none", error: e.message };
-          }
-        };
+        const zenRespTimeout = FAST_ZEN.has(resolved.requested) ? ZEN_TIMEOUT_MS : ZEN_REMAP_TIMEOUT_MS;
 
         try {
-          // Use shorter timeout for remapped (non-live) models so g4f fallback kicks in faster
-          const zenRespTimeout = FAST_ZEN.has(resolved.requested) ? ZEN_TIMEOUT_MS : ZEN_REMAP_TIMEOUT_MS;
-          const meta = await tryZenResponses(resolved.requested, zenRespTimeout);
-          // FIX: zen returned empty stream — inject g4f fallback into the still-open Responses SSE stream
-          if (meta && meta.emptyStream) {
-            console.error("Zen Bridge /v1/responses: zen empty for", resolved.requested, "-> g4f stream fallback");
-            return await injectG4fResponsesStream(meta.respId, meta.itemId, meta.created);
-          }
-          return meta;
+          return await tryZenResponses(resolved.requested, zenRespTimeout);
         } catch (e1) {
-          if (streamReq && res.headersSent) {
+          if (streamReq && res.headersSent)
             return { path: "zen-responses-partial", model: zenModel, streamErr: e1.message };
-          }
+
           // Remap fallback
           if (zenModel !== resolved.requested) {
             try {
-              const meta2 = await tryZenResponses(zenModel);
-              if (meta2 && meta2.emptyStream) {
-                console.error("Zen Bridge /v1/responses: remap zen also empty -> g4f stream fallback");
-                return await injectG4fResponsesStream(meta2.respId, meta2.itemId, meta2.created);
-              }
-              return meta2;
+              console.error("Zen Bridge /v1/responses: exact failed for", resolved.requested, "-> remap", zenModel, e1.message);
+              return await tryZenResponses(zenModel);
             } catch (e2) {
               console.error("Zen Bridge /v1/responses remap failed:", e2.message);
             }
           }
-          // g4f fallback — wrap chat completion as Responses API response
-          const g4fResult = await g4fOnce(chatBody);
-          const text = ((((g4fResult.openaiRes.choices || [])[0] || {}).message || {}).content) || "";
-          const respId = "resp_g4f_" + Date.now().toString(16);
-          const itemId = "item_g4f_" + Date.now().toString(16);
-          const created = Math.floor(Date.now() / 1000);
-          const responsesObj = {
-            id: respId, object: "response", created_at: created, model, status: "completed",
-            output: [{ type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text, annotations: [] }], status: "completed" }],
-            usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
-          };
 
-          if (streamReq && !res.headersSent) {
-            res.writeHead(200, {
-              "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive",
-              ...proofHeaders({ "x-loophole-path": "g4f-responses-fallback" }),
-            });
-            const safeWrite = (obj) => { try { res.write("event: " + obj.type + "\ndata: " + JSON.stringify(obj) + "\n\n"); } catch {} };
-            safeWrite({ type: "response.created", response: { ...responsesObj, status: "in_progress", output: [] } });
-            safeWrite({ type: "response.output_item.added", output_index: 0, item: { type: "message", id: itemId, role: "assistant", content: [], status: "in_progress" } });
-            safeWrite({ type: "response.content_part.added", item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
-            safeWrite({ type: "response.output_text.delta", item_id: itemId, output_index: 0, content_index: 0, delta: text });
-            safeWrite({ type: "response.output_text.done", item_id: itemId, output_index: 0, content_index: 0, text });
-            safeWrite({ type: "response.content_part.done", item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text, annotations: [] } });
-            safeWrite({ type: "response.output_item.done", output_index: 0, item: { type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text, annotations: [] }], status: "completed" } });
-            safeWrite({ type: "response.completed", response: responsesObj });
-            res.write("data: [DONE]\n\n");
-            res.end();
-          } else if (!res.headersSent) {
-            res.writeHead(200, { "Content-Type": "application/json", ...proofHeaders({ "x-loophole-path": "g4f-responses-fallback" }) });
-            res.end(JSON.stringify(responsesObj));
+          // Both failed — return error response
+          const errMsg = "zen failed for " + resolved.requested + ": " + e1.message;
+          console.error("Zen Bridge /v1/responses:", errMsg);
+          if (!res.headersSent) {
+            if (streamReq) {
+              // Emit error as a proper Responses API stream so the SDK doesn't hang
+              const rid = "resp_err_" + Date.now().toString(16);
+              const iid = "item_err_" + Date.now().toString(16);
+              const ts = Math.floor(Date.now() / 1000);
+              const errText = "[zen error: " + errMsg + "]";
+              res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive", ...proofHeaders() });
+              const sw = (obj) => { try { res.write("event: " + obj.type + "\ndata: " + JSON.stringify(obj) + "\n\n"); } catch {} };
+              sw({ type: "response.created", response: { id: rid, object: "response", created_at: ts, model, status: "in_progress", output: [], usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } } });
+              sw({ type: "response.output_item.added", output_index: 0, item: { type: "message", id: iid, role: "assistant", content: [], status: "in_progress" } });
+              sw({ type: "response.content_part.added", item_id: iid, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
+              sw({ type: "response.output_text.delta", item_id: iid, output_index: 0, content_index: 0, delta: errText });
+              sw({ type: "response.output_text.done", item_id: iid, output_index: 0, content_index: 0, text: errText });
+              sw({ type: "response.content_part.done", item_id: iid, output_index: 0, content_index: 0, part: { type: "output_text", text: errText, annotations: [] } });
+              sw({ type: "response.output_item.done", output_index: 0, item: { type: "message", id: iid, role: "assistant", content: [{ type: "output_text", text: errText, annotations: [] }], status: "completed" } });
+              sw({ type: "response.completed", response: { id: rid, object: "response", created_at: ts, model, status: "completed", output: [{ type: "message", id: iid, role: "assistant", content: [{ type: "output_text", text: errText, annotations: [] }], status: "completed" }], usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } } });
+              res.write("data: [DONE]\n\n"); res.end();
+            } else {
+              res.writeHead(502, { "Content-Type": "application/json", ...proofHeaders() });
+              res.end(JSON.stringify({ error: { message: errMsg, type: "zen_error" } }));
+            }
           }
-          return { path: "g4f-responses-fallback", model };
+          return { path: "zen-responses-error", model: zenModel, error: errMsg };
         }
       };
 
@@ -1373,7 +805,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(
-    `Zen bridge REAL: http://127.0.0.1:${PORT} -> serve :${SERVE_PORT} -> rotator -> opencode.ai | race=${FAST_RACE} stream=live-deltas`
-  );
+  console.log(`Zen bridge REAL (no g4f): http://127.0.0.1:${PORT} -> serve :${SERVE_PORT} -> rotator -> opencode.ai | stream=live-deltas`);
 });
