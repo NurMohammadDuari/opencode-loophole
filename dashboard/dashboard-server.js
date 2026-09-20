@@ -628,31 +628,39 @@ document.addEventListener('click',(ev)=>{
 function closeTr(){ el('transcript').style.display='none'; }
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
-let streamRunning=false;
+let streamRunning = false;
+let es = null;
 async function toggleStream(){
   streamRunning=!streamRunning;
   const btn=el('streamBtn');
   if(streamRunning){
     btn.textContent='■ Stop Stream'; btn.className='btn off';
-    const run=async ()=>{
-      if(!streamRunning) return;
+    // Use EventSource for Server‑Sent Events
+    es = new EventSource('/api/stream');
+    es.onmessage = e => {
       try{
-        const r=await fetch('/api/stream');
-        const d=await r.json();
+        const d = JSON.parse(e.data);
         if(d.entries && d.entries.length){
-          el('streamlog').textContent=d.entries.map(e=>new Date(e.ts).toLocaleTimeString()+' '+e.model+' '+(e.stream?'[SSE]':'[JSON]')+' '+e.status+'ms'+(e.error?' ERR:'+e.error:'')+' path='+e.path).join('\n');
-          el('streamlog').scrollTop=el('streamlog').scrollHeight;
-          // update pipeline
-          const last=d.entries[d.entries.length-1];
-          el('pipeline-path').textContent=last.path||'–';
-          el('pipeline-model').textContent=last.model||'–';
+          el('streamlog').textContent = d.entries.map(en =>
+            new Date(en.ts).toLocaleTimeString()+' '+en.model+' '+(en.stream?'[SSE]':'[JSON]')+' '+en.status+'ms'+(en.error?' ERR:'+en.error:'')+' path='+en.path
+          ).join('\n');
+          el('streamlog').scrollTop = el('streamlog').scrollHeight;
+          const last = d.entries[d.entries.length-1];
+          el('pipeline-path').textContent = last.path||'–';
+          el('pipeline-model').textContent = last.model||'–';
         }
       }catch{}
-      if(streamRunning) setTimeout(run,2000);
     };
-    run();
+    es.onerror = () => {
+      if(es){ es.close(); es = null; }
+      streamRunning = false;
+      btn.textContent='▶ Start Stream';
+      btn.className='btn';
+      toast('Stream stopped due to error');
+    };
   } else {
     btn.textContent='▶ Start Stream'; btn.className='btn';
+    if(es){ es.close(); es = null; }
   }
 }
 
