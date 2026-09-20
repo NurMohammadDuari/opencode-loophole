@@ -14,6 +14,11 @@
  *    a 500 response mid-stream
  *  - session.idle detection made more robust: also watches session.updated with
  *    completed time, guards all res.write calls with settled/headersSent checks
+ *  - BLANK OUTPUT FIX: when zen stream times out with fullText="" (no content),
+ *    the stream is NOT closed — instead emptyStream:true is returned and handleChat
+ *    injects g4f fallback SSE chunks into the still-open stream before res.end().
+ *    Previously the stream was closed with [DONE] and no text, causing blank output
+ *    in the opencode CLI/app for any model that timed out on zen.
  */
 const http = require("http");
 const crypto = require("crypto");
@@ -286,6 +291,8 @@ function zenStreamResponsesToClient(res, model, chatBody) {
     // FIX: delay session deletion 2s — gives the opencode client time to finish
     // processing the completed response before the session disappears.
     // Immediate deletion caused "Session not found" and blank output in opencode UI.
+    // FIX 2: when stream timeout fires with fullText=="" (blank output), resolve with
+    // emptyStream:true WITHOUT closing res so caller can inject g4f fallback content.
     const finish = (err) => {
       if (settled) return;
       settled = true;
@@ -295,7 +302,13 @@ function zenStreamResponsesToClient(res, model, chatBody) {
       }, 2000);
       if (err) {
         if (res.headersSent) {
-          // Close the stream cleanly; SDK will surface a partial result
+          // If we got NO text at all — return emptyStream:true without closing res
+          // so the /v1/responses handler can inject g4f fallback events.
+          if (fullText === "") {
+            resolve({ sessionID, text: "", tokens, ms: Date.now() - t0, path: "zen-responses-empty", streamErr: err.message, emptyStream: true, respId, itemId, created });
+            return;
+          }
+          // Has partial content — close gracefully
           try {
             safeWrite({
               type: "response.completed",
@@ -609,6 +622,9 @@ function zenStreamToClient(res, model, body) {
 
     // FIX: never reject after headers are sent — resolve with an error flag instead
     // so the outer .catch doesn't try to write a new 5xx head mid-stream.
+    // FIX 2: when stream timeout fires with fullText=="" (blank output bug), do NOT
+    // call res.end() — instead resolve with emptyStream:true so handleChat can inject
+    // g4f fallback content into the still-open SSE stream before closing it.
     const finish = (err) => {
       if (settled) return;
       settled = true;
@@ -620,10 +636,16 @@ function zenStreamToClient(res, model, body) {
 
       if (err) {
         if (res.headersSent) {
-          // Stream already started — gracefully close it and treat as a soft error
+          // Stream already started but may have no content yet.
+          // If we got NO text at all, return emptyStream:true WITHOUT closing res
+          // so the caller can inject g4f fallback SSE chunks before res.end().
+          if (fullText === "") {
+            resolve({ sessionID, text: "", tokens, ms: Date.now() - t0, path: "zen-stream-empty", streamErr: err.message, emptyStream: true, chatId });
+            return;
+          }
+          // Has partial content — close gracefully
           try {
-            const errId = "chatcmpl-partial-" + Date.now().toString(16);
-            res.write(`data: ${JSON.stringify({ id: errId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+            res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
             res.write("data: [DONE]\n\n");
             res.end();
           } catch {}
@@ -889,6 +911,11 @@ async function handleChat(res, body, stream) {
   const tryZen = async (model, tag) => {
     if (stream) {
       const meta = await zenStreamToClient(res, model, body);
+      // FIX: if zen returned an empty stream (timeout with no content), signal the caller
+      // to inject g4f fallback content via the still-open SSE stream.
+      if (meta.emptyStream) {
+        return { ...meta, path: meta.path || tag, model, requested, remapped: model !== requested };
+      }
       return { path: meta.path || tag, model, requested, remapped: model !== requested, ...meta };
     }
     const result = await zenOnce(model, body);
@@ -906,12 +933,44 @@ async function handleChat(res, body, stream) {
     return { path: tag, model, requested, remapped: model !== requested };
   };
 
+  // Helper: inject g4f text as SSE chunks into an already-started (but not closed) stream
+  const injectG4fStream = async (chatIdForStream) => {
+    try {
+      const g4fResult = await g4fOnce(body);
+      const text = ((((g4fResult.openaiRes.choices || [])[0] || {}).message || {}).content) || "";
+      const cid = chatIdForStream || ("chatcmpl-g4f-" + Date.now().toString(16));
+      try {
+        res.write(`data: ${JSON.stringify({ id: cid, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: requested, choices: [{ index: 0, delta: { content: text }, finish_reason: null }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: cid, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: requested, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+      } catch {}
+      writeProof({ path: "g4f-stream-fallback", model: g4fResult.model, requested, sample: text.slice(0, 160), note: "zen returned empty; injected g4f into open SSE stream" });
+      return { path: "g4f-stream-fallback", model: g4fResult.model, requested, remapped };
+    } catch (e) {
+      // g4f also failed — close stream gracefully with an error message
+      try {
+        const cid = chatIdForStream || ("chatcmpl-err-" + Date.now().toString(16));
+        res.write(`data: ${JSON.stringify({ id: cid, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: requested, choices: [{ index: 0, delta: { content: "[Error: zen timed out and g4f fallback also failed]" }, finish_reason: "stop" }] })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+      } catch {}
+      return { path: "g4f-stream-err", model: "none", requested, remapped, error: e.message };
+    }
+  };
+
   // 1) exact requested on zen (even if not in live list — zen may still accept it)
   if (!stream || true) {
     try {
       if (requested !== zenModel || FAST_ZEN.has(requested) || !remapped) {
         try {
-          return await tryZen(requested, remapped ? "zen-exact" : "zen-live");
+          const meta = await tryZen(requested, remapped ? "zen-exact" : "zen-live");
+          // FIX: zen returned empty stream — inject g4f fallback into the still-open stream
+          if (meta && meta.emptyStream) {
+            console.error("Zen Bridge: zen returned empty for", requested, "-> g4f stream fallback");
+            return await injectG4fStream(meta.chatId);
+          }
+          return meta;
         } catch (e1) {
           // If headers were already sent (stream partial), surface it so the activity log records it
           if (stream && res.headersSent) {
@@ -921,13 +980,23 @@ async function handleChat(res, body, stream) {
           if (MODEL_REMAP[requested] && MODEL_REMAP[requested] !== requested) {
             console.error("Zen Bridge: exact failed for", requested, "-> remap", MODEL_REMAP[requested], e1.message);
             try {
-              return await tryZen(MODEL_REMAP[requested], "zen-remap");
+              const meta2 = await tryZen(MODEL_REMAP[requested], "zen-remap");
+              if (meta2 && meta2.emptyStream) {
+                console.error("Zen Bridge: remap zen also empty for", requested, "-> g4f stream fallback");
+                return await injectG4fStream(meta2.chatId);
+              }
+              return meta2;
             } catch (e2) {
               console.error("Zen Bridge: remap failed, g4f fallback:", e2.message);
             }
           } else if (zenModel !== requested) {
             try {
-              return await tryZen(zenModel, "zen-remap");
+              const meta2 = await tryZen(zenModel, "zen-remap");
+              if (meta2 && meta2.emptyStream) {
+                console.error("Zen Bridge: remap zen also empty for", requested, "-> g4f stream fallback");
+                return await injectG4fStream(meta2.chatId);
+              }
+              return meta2;
             } catch (e2) {
               console.error("Zen Bridge: remap failed, g4f fallback:", e2.message);
             }
@@ -1146,8 +1215,51 @@ const server = http.createServer((req, res) => {
           return result;
         };
 
+        // Helper: inject g4f fallback as Responses API SSE events into already-started stream
+        const injectG4fResponsesStream = async (existingRespId, existingItemId, existingCreated) => {
+          const rid = existingRespId || ("resp_g4f_" + Date.now().toString(16));
+          const iid = existingItemId || ("item_g4f_" + Date.now().toString(16));
+          const ts  = existingCreated || Math.floor(Date.now() / 1000);
+          try {
+            const g4fResult = await g4fOnce(chatBody);
+            const text = ((((g4fResult.openaiRes.choices || [])[0] || {}).message || {}).content) || "";
+            const responsesObj = {
+              id: rid, object: "response", created_at: ts, model, status: "completed",
+              output: [{ type: "message", id: iid, role: "assistant", content: [{ type: "output_text", text, annotations: [] }], status: "completed" }],
+              usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+            };
+            const sw = (obj) => { try { res.write("event: " + obj.type + "\ndata: " + JSON.stringify(obj) + "\n\n"); } catch {} };
+            const seqBase = 10; // safe sequence number after the 3 opening events already sent
+            sw({ type: "response.output_text.delta", sequence_number: seqBase, item_id: iid, output_index: 0, content_index: 0, delta: text });
+            sw({ type: "response.output_text.done", sequence_number: seqBase + 1, item_id: iid, output_index: 0, content_index: 0, text });
+            sw({ type: "response.content_part.done", sequence_number: seqBase + 2, item_id: iid, output_index: 0, content_index: 0, part: { type: "output_text", text, annotations: [] } });
+            sw({ type: "response.output_item.done", sequence_number: seqBase + 3, output_index: 0, item: { type: "message", id: iid, role: "assistant", content: [{ type: "output_text", text, annotations: [] }], status: "completed" } });
+            sw({ type: "response.completed", sequence_number: seqBase + 4, response: responsesObj });
+            try { res.write("data: [DONE]\n\n"); res.end(); } catch {}
+            writeProof({ path: "g4f-responses-stream-fallback", model: g4fResult.model, sample: text.slice(0, 160), note: "zen responses empty; injected g4f into open SSE stream" });
+            return { path: "g4f-responses-stream-fallback", model: g4fResult.model };
+          } catch (e) {
+            // g4f also failed — emit error message and close
+            try {
+              const sw = (obj) => { try { res.write("event: " + obj.type + "\ndata: " + JSON.stringify(obj) + "\n\n"); } catch {} };
+              const errText = "[Error: zen timed out and g4f fallback also failed]";
+              sw({ type: "response.output_text.delta", sequence_number: 10, item_id: iid, output_index: 0, content_index: 0, delta: errText });
+              sw({ type: "response.output_text.done", sequence_number: 11, item_id: iid, output_index: 0, content_index: 0, text: errText });
+              sw({ type: "response.completed", sequence_number: 12, response: { id: rid, object: "response", created_at: ts, model, status: "completed", output: [{ type: "message", id: iid, role: "assistant", content: [{ type: "output_text", text: errText, annotations: [] }], status: "completed" }], usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } } });
+              res.write("data: [DONE]\n\n"); res.end();
+            } catch {}
+            return { path: "g4f-responses-stream-err", model: "none", error: e.message };
+          }
+        };
+
         try {
-          return await tryZenResponses(resolved.requested);
+          const meta = await tryZenResponses(resolved.requested);
+          // FIX: zen returned empty stream — inject g4f fallback into the still-open Responses SSE stream
+          if (meta && meta.emptyStream) {
+            console.error("Zen Bridge /v1/responses: zen empty for", resolved.requested, "-> g4f stream fallback");
+            return await injectG4fResponsesStream(meta.respId, meta.itemId, meta.created);
+          }
+          return meta;
         } catch (e1) {
           if (streamReq && res.headersSent) {
             return { path: "zen-responses-partial", model: zenModel, streamErr: e1.message };
@@ -1155,7 +1267,12 @@ const server = http.createServer((req, res) => {
           // Remap fallback
           if (zenModel !== resolved.requested) {
             try {
-              return await tryZenResponses(zenModel);
+              const meta2 = await tryZenResponses(zenModel);
+              if (meta2 && meta2.emptyStream) {
+                console.error("Zen Bridge /v1/responses: remap zen also empty -> g4f stream fallback");
+                return await injectG4fResponsesStream(meta2.respId, meta2.itemId, meta2.created);
+              }
+              return meta2;
             } catch (e2) {
               console.error("Zen Bridge /v1/responses remap failed:", e2.message);
             }

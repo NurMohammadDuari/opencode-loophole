@@ -6,3 +6,11 @@ node_modules/
 servehome/
 home/
 tool-output/
+auth.json
+bridge-activity.jsonl
+loophole-proof.json
+rotator-proof.jsonl
+opencode.db
+opencode.db-*
+storage/
+log/
