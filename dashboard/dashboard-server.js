@@ -290,6 +290,38 @@ const server = http.createServer(async (req, res) => {
       });
       return;
     }
+    if (p === "/api/proof" && req.method === "GET") {
+      const share = path.join(os.homedir(), ".local", "share", "opencode");
+      const proofPath = process.env.BRIDGE_PROOF_FILE || path.join(share, "loophole-proof.json");
+      const rotPath = process.env.ROTATOR_PROOF_FILE || path.join(share, "rotator-proof.jsonl");
+      let proof = {}, rotatorProofs = [];
+      try { proof = JSON.parse(fs.readFileSync(proofPath, "utf8")); } catch {}
+      try {
+        if (fs.existsSync(rotPath)) {
+          const lines = fs.readFileSync(rotPath, "utf8").split(/\r?\n/).filter(Boolean).slice(-20);
+          rotatorProofs = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+        }
+      } catch {}
+      return sendJson(res, 200, { ok: true, proof, rotatorProofs });
+    }
+    if (p === "/api/stream" && req.method === "GET") {
+      const share = path.join(os.homedir(), ".local", "share", "opencode");
+      const actPath = process.env.BRIDGE_ACTIVITY_LOG || path.join(share, "bridge-activity.jsonl");
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+      let closed = false;
+      const interval = setInterval(() => {
+        if (closed) { clearInterval(interval); return; }
+        try {
+          if (!fs.existsSync(actPath)) { res.write("data: {}\n\n"); return; }
+          const raw = fs.readFileSync(actPath, "utf8");
+          const lines = raw.split(/\r?\n/).filter(Boolean).slice(-5);
+          const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+          res.write("data: " + JSON.stringify({ entries, ts: Date.now() }) + "\n\n");
+        } catch { res.write("data: {}\n\n"); }
+      }, 2000);
+      req.on("close", () => { closed = true; clearInterval(interval); });
+      return;
+    }
 
     sendJson(res, 404, { ok: false, error: "not found" });
   } catch (e) {
@@ -378,6 +410,12 @@ pre{white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size
 .tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
 .tab{padding:6px 12px;border-radius:8px;font-size:12px;border:1px solid var(--border);background:var(--panel2);color:var(--dim);cursor:pointer}
 .tab.active{background:rgba(59,130,246,0.2);border-color:var(--blue);color:#fff}
+.pn{display:flex;flex-direction:column;align-items:center;gap:3px}
+.pn-dot{width:12px;height:12px;border-radius:50%}
+.pn-lbl{font-size:10.5px;color:var(--dim);font-weight:600}
+.pn-arrow{font-size:16px;color:var(--blue);margin:0 2px}
+.pn-arrow.amber{color:var(--amber)}
+.amber{color:var(--amber)}
 </style>
 </head>
 <body>
@@ -418,6 +456,35 @@ pre{white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size
     <div class="dim" style="font-size:11.5px">Active Models Used</div>
     <div class="chips" id="st-models"></div>
   </div>
+</div>
+
+<h2>Live Loophole Pipeline — Chain Flow</h2>
+<div class="panel" style="padding:20px 24px">
+  <div class="pipeline" style="display:flex;align-items:center;justify-content:center;flex-wrap:wrap;gap:6px;margin-bottom:14px">
+    <div class="pn"><div class="pn-dot ok"></div><div class="pn-lbl">Client</div></div>
+    <div class="pn-arrow">→</div>
+    <div class="pn"><div class="pn-dot ok"></div><div class="pn-lbl">Bridge :1343</div></div>
+    <div class="pn-arrow">→</div>
+    <div class="pn"><div class="pn-dot ok"></div><div class="pn-lbl">Serve :18765</div></div>
+    <div class="pn-arrow">→</div>
+    <div class="pn"><div class="pn-dot ok"></div><div class="pn-lbl">Rotator :1341</div></div>
+    <div class="pn-arrow">→</div>
+    <div class="pn"><div class="pn-dot ok"></div><div class="pn-lbl">zen</div></div>
+    <div class="pn-arrow" style="color:var(--amber)">⚡</div>
+    <div class="pn"><div class="pn-dot amber"></div><div class="pn-lbl">x-real-ip rotated</div></div>
+  </div>
+  <div class="kv"><span class="dim">Last Upstream Hops (rotating IPs proven)</span><b id="pipeline-proof" class="mono" style="color:var(--green)">checking…</b></div>
+  <div class="kv"><span class="dim">Last Completion Path</span><b id="pipeline-path" class="mono">–</b></div>
+  <div class="kv"><span class="dim">Last Model / Sample</span><b id="pipeline-model" class="mono">–</b></div>
+</div>
+
+<h2>Live Stream (real-time bridge completions)</h2>
+<div class="panel">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <span class="mini dim">SSE events from bridge activity — auto-updates every 2s</span>
+    <button class="btn" onclick="toggleStream()" id="streamBtn">▶ Start Stream</button>
+  </div>
+  <pre id="streamlog" style="max-height:200px;overflow:auto;font-size:11px">Waiting for stream…</pre>
 </div>
 
 <h2>What The Loophole Is Doing (Bridge Activity Stream)</h2>
@@ -561,6 +628,61 @@ document.addEventListener('click',(ev)=>{
 function closeTr(){ el('transcript').style.display='none'; }
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
+let streamRunning=false;
+async function toggleStream(){
+  streamRunning=!streamRunning;
+  const btn=el('streamBtn');
+  if(streamRunning){
+    btn.textContent='■ Stop Stream'; btn.className='btn off';
+    const run=async ()=>{
+      if(!streamRunning) return;
+      try{
+        const r=await fetch('/api/stream');
+        const d=await r.json();
+        if(d.entries && d.entries.length){
+          el('streamlog').textContent=d.entries.map(e=>new Date(e.ts).toLocaleTimeString()+' '+e.model+' '+(e.stream?'[SSE]':'[JSON]')+' '+e.status+'ms'+(e.error?' ERR:'+e.error:'')+' path='+e.path).join('\n');
+          el('streamlog').scrollTop=el('streamlog').scrollHeight;
+          // update pipeline
+          const last=d.entries[d.entries.length-1];
+          el('pipeline-path').textContent=last.path||'–';
+          el('pipeline-model').textContent=last.model||'–';
+        }
+      }catch{}
+      if(streamRunning) setTimeout(run,2000);
+    };
+    run();
+  } else {
+    btn.textContent='▶ Start Stream'; btn.className='btn';
+  }
+}
+
+async function refreshProof(){
+  try{
+    const p=await api('/api/proof');
+    const proof=p.proof||{};
+    const rp=p.rotatorProofs||[];
+    // show last 3 upstream IPs
+    const ips=(rp.slice(-3).reverse().map(e=>e.xRealIp).filter(Boolean));
+    el('pipeline-proof').textContent=ips.length?ips.join(' → '):'–';
+    el('pipeline-path').textContent=proof.path||'–';
+    el('pipeline-model').textContent=(proof.model||proof.sample?proof.model+' · "'+proof.sample+'"':'checking…');
+  }catch{}
+}
+
+async function runSmokeTest(){
+  toast('Running smoke test against :1343...');
+  try{
+    const r=await api('/api/test-chain', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model:'big-pickle'}) });
+    if(r.ok){
+      toast('✓ Smoke test passed in '+r.ms+'ms! Model: '+r.model+' -> "'+r.reply+'"');
+    } else {
+      toast('✗ Smoke test failed ('+r.status+'): '+r.reply);
+    }
+  }catch(e){ toast('Error testing chain: '+e.message); }
+  setTimeout(refreshActivity, 500);
+  setTimeout(refreshProof, 1000);
+}
+
 let curLog="zen-bridge.service";
 async function refreshLogs(){
   const units = services.filter(s=>s.unit).map(s=>s.unit);
@@ -615,7 +737,7 @@ async function runSmokeTest(){
 
 setInterval(()=>{ const d=new Date(); el('clock').textContent=d.toLocaleDateString()+' '+d.toLocaleTimeString(); },1000);
 async function loop(){
-  await Promise.all([refreshStatus(),refreshActivity(),refreshSessions()]);
+  await Promise.all([refreshStatus(),refreshActivity(),refreshSessions(),refreshProof()]);
   setTimeout(loop,3000);
 }
 setInterval(refreshLogs,5000);

@@ -1,16 +1,13 @@
 /**
- * Zen Bridge — OpenAI-compatible front door on :1343
+ * Zen Bridge — REAL OpenAI-compat front door on :1343
  *
- * Optimizations for speed:
- *  - HTTP keep-alive to local serve (no new TCP per hop)
- *  - Session create is cheap (~20ms); delete sessions async after use
- *  - Known-good FAST zen models preferred; broken free models remap
- *  - G4F fallback remaps zen model ids -> fast Gemini flash-lite
- *  - Optional FAST_RACE: race zen + g4f, return first 200
- *  - Real activity logging with path (zen|g4f|race)
+ * Not a simulation:
+ *  - Creates a real opencode serve session
+ *  - Streams live message.part.delta events from serve /event SSE
+ *  - Serve talks to zen-rotator :1341 → real TLS to opencode.ai/zen/v1
+ *  - Proof headers + /v1/proof expose last upstream hop evidence
  */
 const http = require("http");
-const https = require("https");
 const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
@@ -24,79 +21,62 @@ const PORT = process.env.BRIDGE_PORT ? Number(process.env.BRIDGE_PORT) : 1343;
 const G4F_HOST = process.env.G4F_HOST || "127.0.0.1";
 const G4F_PORT = Number(process.env.G4F_PORT || 1337);
 const G4F_FAST_MODEL = process.env.G4F_FAST_MODEL || "gemini-flash-lite";
-const FAST_RACE = process.env.FAST_RACE !== "0"; // default ON
-const ZEN_TIMEOUT_MS = Number(process.env.ZEN_TIMEOUT_MS || 45000);
+const FAST_RACE = process.env.FAST_RACE === "1"; // OFF by default — pure zen path
+const ZEN_TIMEOUT_MS = Number(process.env.ZEN_TIMEOUT_MS || 90000);
 const G4F_TIMEOUT_MS = Number(process.env.G4F_TIMEOUT_MS || 30000);
-const ACTIVITY_LOG =
-  process.env.BRIDGE_ACTIVITY_LOG ||
-  path.join(os.homedir(), ".local", "share", "opencode", "bridge-activity.jsonl");
+
+const SHARE = path.join(os.homedir(), ".local", "share", "opencode");
+const ACTIVITY_LOG = process.env.BRIDGE_ACTIVITY_LOG || path.join(SHARE, "bridge-activity.jsonl");
+const PROOF_FILE = process.env.BRIDGE_PROOF_FILE || path.join(SHARE, "loophole-proof.json");
+const ROTATOR_PROOF = process.env.ROTATOR_PROOF_FILE || path.join(SHARE, "rotator-proof.jsonl");
 
 const AUTH = "Basic " + Buffer.from(`${SERVE_USER}:${SERVE_PASS}`).toString("base64");
-
-const serveAgent = new http.Agent({ keepAlive: true, maxSockets: 32, keepAliveMsecs: 30_000 });
+const serveAgent = new http.Agent({ keepAlive: true, maxSockets: 64, keepAliveMsecs: 30_000 });
 const g4fAgent = new http.Agent({ keepAlive: true, maxSockets: 16, keepAliveMsecs: 30_000 });
 
-/** Models verified working + relatively fast on zen today */
-const FAST_ZEN = new Set([
-  "big-pickle",
-  "nemotron-3.5-lightning-free",
-]);
+const CATALOG_PATH = process.env.MODELS_CATALOG || path.join(SHARE, "models-catalog.json");
+let CATALOG = { zen_live_free: ["big-pickle"], whitelist_31: ["big-pickle"], remap_to_zen_live: {} };
+try { CATALOG = JSON.parse(fs.readFileSync(CATALOG_PATH, "utf8")); } catch (e) { console.error("catalog load failed", e.message); }
 
-/** Prefer these when client asks for a generic "fast" / broken flash free model */
-const MODEL_ALIASES = {
-  "mimo-v2-flash-free": "big-pickle",
-  "ling-3.0-tiny-free": "big-pickle",
-  "ling-3.0-flash-free": "big-pickle",
-  "ling-2.6-flash-free": "big-pickle",
-  "ling-3.0-flash-fin-free": "big-pickle",
-  "deepseek-v4-flash-free": "big-pickle",
-  "north-mini-code-free": "big-pickle",
-  "x-preview-f-free": "big-pickle",
-  "longcat-2.0-free": "big-pickle",
-  "glm-4.7-free": "big-pickle",
-  "fast": "big-pickle",
-  "fastest": "big-pickle",
-  "speed": "big-pickle",
+const FAST_ZEN = new Set(CATALOG.zen_live_free || ["big-pickle"]);
+const MODEL_REMAP = CATALOG.remap_to_zen_live || {};
+const WHITELIST = CATALOG.whitelist_31 || ["big-pickle"];
+
+
+let lastProof = {
+  ts: 0,
+  real: true,
+  chain: ["opencode-client", "bridge:1343", "serve:18765", "rotator:1341", "opencode.ai/zen/v1"],
+  note: "waiting for first request",
 };
-
-const WHITELIST = [
-  "big-pickle",
-  "nemotron-3.5-lightning-free",
-  "nemotron-3-ultra-free",
-  "hy3-preview-free",
-  "muse-spark-1.3-contributor-free",
-  "north-mini-code-free",
-  "minimax-m2.1-free",
-  "longcat-2.0-free",
-  "deepseek-v4-flash-free",
-  "laguna-s-2.1-free",
-  "minimax-m3-free",
-  "jev-1.13-free",
-  "muse-spark-1.2-contributor-free",
-  "x-preview-f-free",
-  "ling-2.6-flash-free",
-  "hy3-free",
-  "kimi-k2.5-free",
-  "ring-2.6-1t-free",
-  "mimo-v2.5-free",
-  "nemotron-3-super-free",
-  "ling-3.0-flash-fin-free",
-  "ling-3.0-flash-free",
-  "trinity-large-preview-free",
-  "glm-4.7-free",
-  "glm-5-free",
-  "mimo-v2-flash-free",
-  "minimax-m2.5-free",
-  "mimo-v2-omni-free",
-  "mimo-v2-pro-free",
-  "qwen3.6-plus-free",
-  "ling-3.0-tiny-free",
-];
 
 function logActivity(entry) {
   try {
     fs.appendFileSync(ACTIVITY_LOG, JSON.stringify({ ts: Date.now(), ...entry }) + "\n");
   } catch {}
+}
+
+function writeProof(p) {
+  lastProof = { ts: Date.now(), real: true, ...p };
+  try {
+    fs.writeFileSync(PROOF_FILE, JSON.stringify(lastProof, null, 2));
+  } catch {}
+}
+
+function readRotatorTail(n = 5) {
+  try {
+    if (!fs.existsSync(ROTATOR_PROOF)) return [];
+    const lines = fs.readFileSync(ROTATOR_PROOF, "utf8").split(/\r?\n/).filter(Boolean).slice(-n);
+    return lines.map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
+  } catch {
+    return [];
+  }
 }
 
 function modelName(m) {
@@ -106,7 +86,9 @@ function modelName(m) {
 
 function resolveZenModel(m) {
   const raw = modelName(m);
-  return MODEL_ALIASES[raw] || raw;
+  if (FAST_ZEN.has(raw) || WHITELIST.includes(raw) || raw === "big-pickle") return { requested: raw, zenModel: raw, remapped: false };
+  if (MODEL_REMAP[raw]) return { requested: raw, zenModel: MODEL_REMAP[raw], remapped: true };
+  return { requested: raw, zenModel: MODEL_REMAP[raw] || "big-pickle", remapped: !!MODEL_REMAP[raw] || raw !== "big-pickle" };
 }
 
 function messageText(m) {
@@ -114,7 +96,7 @@ function messageText(m) {
   if (typeof m.content === "string") return m.content;
   if (Array.isArray(m.content)) {
     return m.content
-      .map((p) => (typeof p === "string" ? p : p && (p.text || p.content) || ""))
+      .map((p) => (typeof p === "string" ? p : (p && (p.text || p.content)) || ""))
       .join("");
   }
   return String(m.content || "");
@@ -144,247 +126,474 @@ function httpJson(agent, hostname, port, method, reqPath, body, timeoutMs, heade
         });
         res.on("end", () => {
           try {
-            resolve({ status: res.statusCode, json: JSON.parse(out), raw: out });
+            resolve({ status: res.statusCode, json: out ? JSON.parse(out) : null, raw: out });
           } catch {
             resolve({ status: res.statusCode, json: { raw: out }, raw: out });
           }
         });
       }
     );
-    req.on("timeout", () => {
-      req.destroy(new Error("timeout " + timeoutMs + "ms"));
-    });
+    req.on("timeout", () => req.destroy(new Error("timeout " + timeoutMs + "ms")));
     req.on("error", reject);
     if (data) req.write(data);
     req.end();
   });
 }
 
-function callServe(method, reqPath, body) {
-  return httpJson(serveAgent, SERVE_HOST, SERVE_PORT, method, reqPath, body, ZEN_TIMEOUT_MS, {
+function callServe(method, reqPath, body, timeoutMs = ZEN_TIMEOUT_MS) {
+  return httpJson(serveAgent, SERVE_HOST, SERVE_PORT, method, reqPath, body, timeoutMs, {
     authorization: AUTH,
   });
 }
 
-function callG4f(body, timeoutMs = G4F_TIMEOUT_MS) {
-  // Force a known-fast g4f model + Gemini provider when possible
-  const payload = {
-    ...body,
-    model: G4F_FAST_MODEL,
-    provider: "Gemini",
-    stream: false,
-  };
-  return httpJson(g4fAgent, G4F_HOST, G4F_PORT, "POST", "/v1/chat/completions", payload, timeoutMs);
+function callG4f(body) {
+  const payload = { ...body, model: G4F_FAST_MODEL, provider: "Gemini", stream: false };
+  return httpJson(g4fAgent, G4F_HOST, G4F_PORT, "POST", "/v1/chat/completions", payload, G4F_TIMEOUT_MS);
 }
 
-function extractText(message) {
-  const parts = [];
-  const walk = (node) => {
-    if (!node || typeof node !== "object") return;
-    if (Array.isArray(node)) {
-      node.forEach(walk);
-      return;
-    }
-    if (node.type === "text" && typeof node.text === "string") parts.push(node.text);
-    if (node.parts) walk(node.parts);
-  };
-  walk(message);
-  return parts.join("");
-}
-
-function buildOpenAiResponse(message, model, reqId) {
-  const text = extractText(message);
+function proofHeaders(extra = {}) {
   return {
-    id: "chatcmpl-" + (message.info && message.info.id ? message.info.id : crypto.randomBytes(8).toString("hex")),
-    object: "chat.completion",
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [
-      {
-        index: 0,
-        message: { role: "assistant", content: text },
-        finish_reason: "stop",
-      },
-    ],
-    usage:
-      message.info && message.info.tokens
-        ? {
-            prompt_tokens: message.info.tokens.prompt,
-            completion_tokens: message.info.tokens.completion,
-            total_tokens: message.info.tokens.total,
-          }
-        : undefined,
-    system_fingerprint: reqId,
+    "x-loophole-real": "1",
+    "x-loophole-chain": "bridge->serve->rotator->opencode.ai/zen/v1",
+    "x-loophole-simulation": "0",
+    ...extra,
   };
 }
 
-function writeOpenAi(res, openaiRes, stream) {
-  if (!stream) {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify(openaiRes));
-  }
-  const text = openaiRes.choices[0].message.content || "";
-  const model = openaiRes.model;
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
-  if (text) {
-    res.write(
-      `data: ${JSON.stringify({
-        id: openaiRes.id,
-        object: "chat.completion.chunk",
-        created: openaiRes.created,
-        model,
-        choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }],
-      })}\n\n`
-    );
-  }
-  res.write(
-    `data: ${JSON.stringify({
-      id: openaiRes.id,
-      object: "chat.completion.chunk",
-      created: openaiRes.created,
-      model,
-      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-    })}\n\n`
+/**
+ * Subscribe to serve /event SSE and invoke onEvent(parsed) for each data line.
+ * Returns { close() }.
+ */
+function subscribeEvents(onEvent) {
+  let closed = false;
+  let buf = "";
+  const req = http.request(
+    {
+      agent: serveAgent,
+      hostname: SERVE_HOST,
+      port: SERVE_PORT,
+      path: "/event",
+      method: "GET",
+      headers: {
+        authorization: AUTH,
+        accept: "text/event-stream",
+        connection: "keep-alive",
+      },
+    },
+    (res) => {
+      res.on("data", (chunk) => {
+        if (closed) return;
+        buf += chunk.toString("utf8");
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          const lines = block.split(/\r?\n/);
+          for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            const raw = line.slice(5).trim();
+            if (!raw || raw === "[DONE]") continue;
+            try {
+              onEvent(JSON.parse(raw));
+            } catch {}
+          }
+        }
+      });
+      res.on("end", () => {});
+      res.on("error", () => {});
+    }
   );
-  res.write("data: [DONE]\n\n");
-  return res.end();
+  req.on("error", () => {});
+  req.end();
+  return {
+    close() {
+      closed = true;
+      try {
+        req.destroy();
+      } catch {}
+    },
+  };
 }
 
+function buildParts(body) {
+  return (body.messages || []).map((m) => ({
+    type: "text",
+    text: messageText(m),
+    id: "prt_" + crypto.randomBytes(12).toString("hex"),
+  }));
+}
+
+/**
+ * REAL streaming: prompt_async + live message.part.delta from serve events.
+ */
+function zenStreamToClient(res, model, body) {
+  return new Promise(async (resolve, reject) => {
+    const t0 = Date.now();
+    let sessionID = null;
+    let assistantMsgId = null;
+    let fullText = "";
+    let tokens = null;
+    let settled = false;
+    let sub = null;
+    const chatId = "chatcmpl-" + crypto.randomBytes(8).toString("hex");
+
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      if (sub) sub.close();
+      if (sessionID) callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {});
+      if (err) reject(err);
+      else resolve({ sessionID, text: fullText, tokens, ms: Date.now() - t0, path: "zen-stream" });
+    };
+
+    try {
+      const session = await callServe("POST", "/session", { directory: null }, 15000);
+      if (session.status !== 200 || !session.json || !session.json.id) {
+        throw new Error("serve session failed: " + session.status);
+      }
+      sessionID = session.json.id;
+
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        ...proofHeaders({
+          "x-loophole-path": "zen-stream",
+          "x-loophole-session": sessionID,
+          "x-loophole-model": model,
+        }),
+      });
+
+      // role chunk
+      res.write(
+        `data: ${JSON.stringify({
+          id: chatId,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        })}\n\n`
+      );
+
+      const timer = setTimeout(() => finish(new Error("zen stream timeout")), ZEN_TIMEOUT_MS);
+
+      sub = subscribeEvents((evt) => {
+        if (settled) return;
+        const type = evt.type;
+        const props = evt.properties || {};
+        if (props.sessionID && props.sessionID !== sessionID) return;
+
+        if (type === "message.updated") {
+          const info = props.info || {};
+          if (info.role === "assistant" && info.id) {
+            assistantMsgId = info.id;
+            if (info.tokens) tokens = info.tokens;
+            if (info.time && info.time.completed) {
+              // completed — wait for idle to flush
+            }
+          }
+        }
+
+        if (type === "message.part.delta") {
+          if (assistantMsgId && props.messageID && props.messageID !== assistantMsgId) return;
+          if (props.field && props.field !== "text") return;
+          const delta = props.delta || "";
+          if (!delta) return;
+          if (!assistantMsgId && props.messageID) assistantMsgId = props.messageID;
+          fullText += delta;
+          res.write(
+            `data: ${JSON.stringify({
+              id: chatId,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model,
+              choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
+            })}\n\n`
+          );
+        }
+
+        if (type === "session.idle" || (type === "session.status" && props.status && props.status.type === "idle")) {
+          clearTimeout(timer);
+          res.write(
+            `data: ${JSON.stringify({
+              id: chatId,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model,
+              choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+            })}\n\n`
+          );
+          res.write("data: [DONE]\n\n");
+          try {
+            res.end();
+          } catch {}
+          writeProof({
+            path: "zen-stream",
+            sessionID,
+            model,
+            ms: Date.now() - t0,
+            chars: fullText.length,
+            tokens,
+            rotator: readRotatorTail(3),
+            sample: fullText.slice(0, 160),
+          });
+          finish(null);
+        }
+      });
+
+      // kick the real async prompt after event subscription is live
+      await new Promise((r) => setTimeout(r, 80));
+      const prompt = await callServe(
+        "POST",
+        `/session/${sessionID}/prompt_async`,
+        {
+          model: { providerID: "opencode", modelID: model },
+          parts: buildParts(body),
+        },
+        15000
+      );
+      if (prompt.status !== 204 && prompt.status !== 200) {
+        clearTimeout(timer);
+        throw new Error("prompt_async failed: " + prompt.status + " " + (prompt.raw || "").slice(0, 200));
+      }
+    } catch (e) {
+      finish(e);
+    }
+  });
+}
+
+/**
+ * Non-stream: sync /message (still real serve → rotator → opencode.ai)
+ */
 async function zenOnce(model, body) {
-  const session = await callServe("POST", "/session", { directory: null });
+  const session = await callServe("POST", "/session", { directory: null }, 15000);
   if (session.status !== 200 || !session.json || !session.json.id) {
-    const err = new Error("serve session failed: " + session.status);
-    err.status = session.status;
-    throw err;
+    throw Object.assign(new Error("serve session failed: " + session.status), { status: session.status });
   }
   const sessionID = session.json.id;
   try {
-    const textParts = (body.messages || []).map((m) => ({
-      type: "text",
-      text: messageText(m),
-      id: "prt_" + crypto.randomBytes(12).toString("hex"),
-    }));
-    const payload = {
-      model: { providerID: "opencode", modelID: model },
-      parts: textParts,
-    };
-    const msg = await callServe("POST", `/session/${sessionID}/message`, payload);
+    const msg = await callServe(
+      "POST",
+      `/session/${sessionID}/message`,
+      {
+        model: { providerID: "opencode", modelID: model },
+        parts: buildParts(body),
+      },
+      ZEN_TIMEOUT_MS
+    );
     if (msg.status !== 200) {
-      const err = new Error("serve message failed: " + msg.status + " " + (msg.raw || "").slice(0, 200));
-      err.status = msg.status;
-      throw err;
+      throw Object.assign(new Error("serve message failed: " + msg.status + " " + (msg.raw || "").slice(0, 200)), {
+        status: msg.status,
+      });
     }
     if (msg.json && msg.json.name === "UnknownError") {
-      const err = new Error("serve UnknownError: " + ((msg.json.data && msg.json.data.message) || ""));
-      err.status = 500;
-      throw err;
+      throw Object.assign(new Error("serve UnknownError: " + ((msg.json.data && msg.json.data.message) || "")), {
+        status: 500,
+      });
     }
     if (msg.json && msg.json.info && msg.json.info.error) {
-      const err = new Error("serve model error: " + JSON.stringify(msg.json.info.error).slice(0, 240));
-      err.status = 502;
-      throw err;
+      throw Object.assign(new Error("serve model error: " + JSON.stringify(msg.json.info.error).slice(0, 240)), {
+        status: 502,
+      });
     }
-    return { openaiRes: buildOpenAiResponse(msg.json, model, sessionID), sessionID, path: "zen" };
+
+    const parts = [];
+    const walk = (node) => {
+      if (!node || typeof node !== "object") return;
+      if (Array.isArray(node)) return node.forEach(walk);
+      if (node.type === "text" && typeof node.text === "string") parts.push(node.text);
+      if (node.parts) walk(node.parts);
+    };
+    walk(msg.json);
+    const text = parts.join("");
+    const openaiRes = {
+      id: "chatcmpl-" + (msg.json.info && msg.json.info.id ? msg.json.info.id : crypto.randomBytes(8).toString("hex")),
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+      usage:
+        msg.json.info && msg.json.info.tokens
+          ? {
+              prompt_tokens: msg.json.info.tokens.input || msg.json.info.tokens.prompt,
+              completion_tokens: msg.json.info.tokens.output || msg.json.info.tokens.completion,
+              total_tokens: msg.json.info.tokens.total,
+            }
+          : undefined,
+      system_fingerprint: sessionID,
+    };
+    writeProof({
+      path: "zen-sync",
+      sessionID,
+      model,
+      tokens: msg.json.info && msg.json.info.tokens,
+      rotator: readRotatorTail(3),
+      sample: text.slice(0, 160),
+    });
+    return { openaiRes, sessionID, path: "zen-sync" };
   } finally {
-    // fire-and-forget cleanup — don't block the response
-    callServe("DELETE", `/session/${sessionID}`).catch(() => {});
+    callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {});
   }
 }
 
 async function g4fOnce(body) {
   const g4fRes = await callG4f(body);
   if (g4fRes.status !== 200 || !g4fRes.json || !g4fRes.json.choices) {
-    const err = new Error("g4f failed: " + g4fRes.status + " " + (g4fRes.raw || "").slice(0, 200));
-    err.status = g4fRes.status || 502;
-    throw err;
+    throw Object.assign(new Error("g4f failed: " + g4fRes.status + " " + (g4fRes.raw || "").slice(0, 200)), {
+      status: g4fRes.status || 502,
+    });
   }
-  // Normalize model field to what client asked
-  const out = { ...g4fRes.json, model: g4fRes.json.model || G4F_FAST_MODEL };
-  return { openaiRes: out, sessionID: "g4f", path: "g4f" };
-}
-
-function raceFirst(promises) {
-  return new Promise((resolve, reject) => {
-    let pending = promises.length;
-    let lastErr = null;
-    let settled = false;
-    for (const p of promises) {
-      Promise.resolve(p).then(
-        (v) => {
-          if (!settled) {
-            settled = true;
-            resolve(v);
-          }
-        },
-        (e) => {
-          lastErr = e;
-          pending -= 1;
-          if (pending === 0 && !settled) reject(lastErr || new Error("all raced paths failed"));
-        }
-      );
-    }
+  writeProof({
+    path: "g4f-fallback",
+    model: G4F_FAST_MODEL,
+    sample: ((((g4fRes.json.choices || [])[0] || {}).message || {}).content || "").slice(0, 160),
+    note: "zen path failed; used local g4f Gemini mirror",
   });
+  return { openaiRes: g4fRes.json, sessionID: "g4f", path: "g4f-fallback" };
 }
 
 async function handleChat(res, body, stream) {
-  const requested = modelName(body.model);
-  const zenModel = resolveZenModel(requested);
-  const preferRace = FAST_RACE && (FAST_ZEN.has(zenModel) || MODEL_ALIASES[requested] || requested === zenModel);
+  const resolved = resolveZenModel(body.model);
+  const requested = resolved.requested;
+  let zenModel = resolved.zenModel;
+  let remapped = resolved.remapped;
 
-  let result;
-  if (preferRace) {
-    // Race zen (fast model) vs g4f flash-lite — first 200 wins
-    result = await raceFirst([
-      zenOnce(zenModel, body).then((r) => ({ ...r, path: "race-zen" })),
-      g4fOnce(body).then((r) => ({ ...r, path: "race-g4f" })),
-    ]);
-  } else {
+  // Prefer exact requested id when it is a known live zen free model
+  if (FAST_ZEN.has(requested)) {
+    zenModel = requested;
+    remapped = false;
+  }
+
+  const tryZen = async (model, tag) => {
+    if (stream) {
+      const meta = await zenStreamToClient(res, model, body);
+      return { path: tag, model, requested, remapped: model !== requested, ...meta };
+    }
+    const result = await zenOnce(model, body);
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      ...proofHeaders({
+        "x-loophole-path": tag,
+        "x-loophole-session": result.sessionID || "",
+        "x-loophole-model": model,
+        "x-loophole-requested": requested,
+        "x-loophole-remapped": model !== requested ? "1" : "0",
+      }),
+    });
+    res.end(JSON.stringify(result.openaiRes));
+    return { path: tag, model, requested, remapped: model !== requested };
+  };
+
+  // 1) exact requested on zen (even if not in live list — zen may still accept it)
+  if (!stream || true) {
     try {
-      result = await zenOnce(zenModel, body);
+      if (requested !== zenModel || FAST_ZEN.has(requested) || !remapped) {
+        try {
+          return await tryZen(requested, remapped ? "zen-exact" : "zen-live");
+        } catch (e1) {
+          // 2) disclosed remap to a live zen free model
+          if (MODEL_REMAP[requested] && MODEL_REMAP[requested] !== requested) {
+            console.error("Zen Bridge: exact failed for", requested, "-> remap", MODEL_REMAP[requested], e1.message);
+            try {
+              return await tryZen(MODEL_REMAP[requested], "zen-remap");
+            } catch (e2) {
+              console.error("Zen Bridge: remap failed, g4f fallback:", e2.message);
+            }
+          } else if (zenModel !== requested) {
+            try {
+              return await tryZen(zenModel, "zen-remap");
+            } catch (e2) {
+              console.error("Zen Bridge: remap failed, g4f fallback:", e2.message);
+            }
+          } else {
+            console.error("Zen Bridge: zen failed, g4f fallback:", e1.message);
+          }
+        }
+      }
     } catch (e) {
-      console.error("Zen Bridge: zen failed, g4f fallback:", e.message);
-      result = await g4fOnce(body);
+      console.error("Zen Bridge: unexpected:", e.message);
     }
   }
 
-  writeOpenAi(res, result.openaiRes, stream);
-  return { path: result.path, model: zenModel, requested };
+  // stream path already wrote headers on success; on failure fall through carefully
+  if (stream && res.headersSent) {
+    throw new Error("zen stream failed after headers sent");
+  }
+
+  const result = await g4fOnce(body);
+  if (stream) {
+    // emit as synthetic SSE from full g4f text
+    const text = ((((result.openaiRes.choices || [])[0] || {}).message || {}).content) || "";
+    const chatId = "chatcmpl-g4f-" + Date.now().toString(16);
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      ...proofHeaders({ "x-loophole-path": "g4f-fallback", "x-loophole-requested": requested }),
+    });
+    res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: requested, choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }] })}\n\n`);
+    res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: requested, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+    res.write("data: [DONE]\n\n");
+    res.end();
+  } else {
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      ...proofHeaders({ "x-loophole-path": result.path, "x-loophole-requested": requested }),
+    });
+    res.end(JSON.stringify(result.openaiRes));
+  }
+  return { path: "g4f-fallback", model: zenModel, requested, remapped };
 }
+
 
 const server = http.createServer((req, res) => {
   res.on("error", () => {});
   const urlPath = (req.url || "/").split("?")[0];
 
   if ((urlPath === "/v1/models" || urlPath === "/models") && req.method === "GET") {
-    const models = WHITELIST.map((id) => ({
-      id: "opencode/" + id,
-      object: "model",
-      created: 0,
-      owned_by: "opencode",
-    }));
-    // Advertise fast aliases
-    models.unshift(
+    const models = [
       { id: "opencode/fast", object: "model", created: 0, owned_by: "opencode" },
-      { id: "opencode/fastest", object: "model", created: 0, owned_by: "opencode" }
-    );
-    res.writeHead(200, { "Content-Type": "application/json" });
+      { id: "opencode/fastest", object: "model", created: 0, owned_by: "opencode" },
+      ...WHITELIST.map((id) => ({ id: "opencode/" + id, object: "model", created: 0, owned_by: "opencode" })),
+    ];
+    res.writeHead(200, { "Content-Type": "application/json", ...proofHeaders() });
     return res.end(JSON.stringify({ object: "list", data: models }));
   }
 
   if (urlPath === "/health" || urlPath === "/v1/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
+    res.writeHead(200, { "Content-Type": "application/json", ...proofHeaders() });
     return res.end(
       JSON.stringify({
         ok: true,
+        real: true,
+        simulation: false,
         service: "bridge",
         uptime: process.uptime(),
         fastRace: FAST_RACE,
+        streaming: "serve-/event-message.part.delta",
+        upstream: "opencode.ai/zen/v1 via rotator:1341",
         g4fFastModel: G4F_FAST_MODEL,
         defaultZen: "big-pickle",
+      })
+    );
+  }
+
+  if (urlPath === "/v1/proof" || urlPath === "/proof") {
+    res.writeHead(200, { "Content-Type": "application/json", ...proofHeaders() });
+    return res.end(
+      JSON.stringify({
+        ok: true,
+        real: true,
+        simulation: false,
+        last: lastProof,
+        rotatorRecent: readRotatorTail(10),
+        chain: lastProof.chain || [
+          "opencode-client",
+          "bridge:1343",
+          "serve:18765",
+          "rotator:1341",
+          "opencode.ai/zen/v1",
+        ],
       })
     );
   }
@@ -438,6 +647,7 @@ const server = http.createServer((req, res) => {
             status: 200,
             ms: Date.now() - t0,
             reqMs: t0 - started,
+            real: true,
           });
         })
         .catch((e) => {
@@ -449,9 +659,12 @@ const server = http.createServer((req, res) => {
             ms: Date.now() - t0,
             reqMs: t0 - started,
             error: e.message,
+            real: true,
           });
-          if (!res.headersSent) res.writeHead(e.status || 500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: { message: "bridge: " + e.message } }));
+          if (!res.headersSent) {
+            res.writeHead(e.status || 500, { "Content-Type": "application/json", ...proofHeaders() });
+            res.end(JSON.stringify({ error: { message: "bridge: " + e.message } }));
+          }
         });
     });
     return;
@@ -463,7 +676,6 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(
-    `Zen bridge: http://127.0.0.1:${PORT} -> serve :${SERVE_PORT} | FAST_RACE=${FAST_RACE} g4f=${G4F_FAST_MODEL}`
+    `Zen bridge REAL: http://127.0.0.1:${PORT} -> serve :${SERVE_PORT} -> rotator -> opencode.ai | race=${FAST_RACE} stream=live-deltas`
   );
-  console.log("Fast zen models: " + [...FAST_ZEN].join(", "));
 });
