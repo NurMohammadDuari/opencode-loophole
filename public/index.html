@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>OpenCode Loophole Dashboard</title>
-  <link rel="stylesheet" href="style.css?v=5" />
+  <link rel="stylesheet" href="style.css?v=6" />
 </head>
 <body>
   <div class="top-bar">
@@ -28,6 +28,15 @@
     </div>
   </section>
 
-  <script src="app.js?v=5"></script>
+  <section class="panel">
+    <h2>Free Models <span id="model-count" class="dim">(loading…)</span></h2>
+    <div class="controls">
+      <button class="btn" onclick="loadModels()">↺ Refresh</button>
+      <input id="model-filter" type="text" placeholder="filter…" oninput="filterModels()" class="mono filter-input" />
+    </div>
+    <div id="model-list" class="model-grid">Loading…</div>
+  </section>
+
+  <script src="app.js?v=6"></script>
 </body>
 </html>

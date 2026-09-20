@@ -34,9 +34,27 @@ const AUTH = "Basic " + Buffer.from(`${SERVE_USER}:${SERVE_PASS}`).toString("bas
 const serveAgent = new http.Agent({ keepAlive: true, maxSockets: 64, keepAliveMsecs: 30_000 });
 const g4fAgent = new http.Agent({ keepAlive: true, maxSockets: 16, keepAliveMsecs: 30_000 });
 
-const CATALOG_PATH = process.env.MODELS_CATALOG || path.join(SHARE, "models-catalog.json");
+// Try catalog from multiple locations so a missing servehome copy never silently falls back to big-pickle only
+const CATALOG_CANDIDATES = process.env.MODELS_CATALOG
+  ? [process.env.MODELS_CATALOG]
+  : [
+      path.join(SHARE, "models-catalog.json"),                                   // servehome path (bridge HOME)
+      path.join(os.homedir(), ".local", "share", "opencode", "models-catalog.json"), // real HOME
+      path.join(__dirname, "models-catalog.json"),                                // next to this file
+      path.join(__dirname, "..", "models-catalog.json"),                          // one level up
+      path.join(__dirname, "..", "config", "models-catalog.json"),                // config/ subdir
+    ];
 let CATALOG = { zen_live_free: ["big-pickle"], whitelist_31: ["big-pickle"], remap_to_zen_live: {} };
-try { CATALOG = JSON.parse(fs.readFileSync(CATALOG_PATH, "utf8")); } catch (e) { console.error("catalog load failed", e.message); }
+let catalogLoaded = false;
+for (const cp of CATALOG_CANDIDATES) {
+  try {
+    CATALOG = JSON.parse(fs.readFileSync(cp, "utf8"));
+    console.log("catalog loaded from", cp, "—", (CATALOG.whitelist_31 || []).length, "models");
+    catalogLoaded = true;
+    break;
+  } catch {}
+}
+if (!catalogLoaded) console.error("catalog load failed — all candidate paths tried, using big-pickle fallback");
 
 const FAST_ZEN = new Set(CATALOG.zen_live_free || ["big-pickle"]);
 const MODEL_REMAP = CATALOG.remap_to_zen_live || {};
