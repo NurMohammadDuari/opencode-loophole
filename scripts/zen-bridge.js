@@ -95,10 +95,63 @@ function modelName(m) {
 
 function resolveZenModel(m) {
   const raw = modelName(m);
-  if (FAST_ZEN.has(raw) || WHITELIST.includes(raw) || raw === "big-pickle")
+  // Confirmed-live models always pass through as-is
+  if (FAST_ZEN.has(raw) || raw === "big-pickle")
     return { requested: raw, zenModel: raw, remapped: false };
-  if (MODEL_REMAP[raw]) return { requested: raw, zenModel: MODEL_REMAP[raw], remapped: true };
+  // Explicit remap for non-live / flaky ids (including whitelist entries)
+  if (MODEL_REMAP[raw])
+    return { requested: raw, zenModel: MODEL_REMAP[raw], remapped: true };
+  // Whitelisted but not in remap — try exact id (recovery falls back to big-pickle)
+  if (WHITELIST.includes(raw))
+    return { requested: raw, zenModel: raw, remapped: false };
   return { requested: raw, zenModel: "big-pickle", remapped: true };
+}
+
+function normalizeBridgePath(raw) {
+  let p = (raw || "/").split("?")[0] || "/";
+  if (p.length > 1 && p.endsWith("/")) p = p.slice(0, -1);
+  // OpenCode / openai-sdk sometimes double-prefix when baseURL already ends in /v1
+  if (p.startsWith("/v1/v1/")) p = p.slice(3);
+  return p;
+}
+
+function extractAssistantText(messages) {
+  let text = "";
+  let tokens = null;
+  if (!Array.isArray(messages)) return { text, tokens };
+  for (const msg of messages) {
+    if (!msg || !msg.info || msg.info.role !== "assistant") continue;
+    for (const part of (msg.parts || [])) {
+      if (part && part.type === "text" && part.text) text += part.text;
+    }
+    if (msg.info.tokens) tokens = msg.info.tokens;
+  }
+  return { text, tokens };
+}
+
+/** When stream idles with no text, sync-retry same model then big-pickle. */
+async function recoverTextAfterEmpty(model, chatBody) {
+  const tried = [];
+  for (const mdl of [model, "big-pickle"]) {
+    if (tried.includes(mdl)) continue;
+    tried.push(mdl);
+    try {
+      const result = await zenOnce(mdl, chatBody);
+      const text = ((((result.openaiRes || {}).choices || [])[0] || {}).message || {}).content || "";
+      if (text && String(text).trim()) {
+        return {
+          text: String(text),
+          model: mdl,
+          tokens: (result.openaiRes && result.openaiRes.usage) || null,
+          path: mdl === model ? "zen-sync-recover" : "zen-bigpickle-recover",
+          sessionID: result.sessionID,
+        };
+      }
+    } catch (e) {
+      console.error("Zen Bridge: recover via", mdl, "failed:", e.message);
+    }
+  }
+  return null;
 }
 
 function messageText(m) {
@@ -279,20 +332,46 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
         }
       }, 2000);
 
+      function emitResponsesText(text, pathTag) {
+        safeWrite({ type: "response.output_text.delta", item_id: itemId, output_index: 0, content_index: 0, delta: text });
+        safeWrite({ type: "response.output_text.done", item_id: itemId, output_index: 0, content_index: 0, text });
+        safeWrite({ type: "response.content_part.done", item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text, annotations: [] } });
+        safeWrite({ type: "response.output_item.done", output_index: 0, item: { type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text, annotations: [] }], status: "completed" } });
+        safeWrite({ type: "response.completed", response: buildResponseObj(respId, model, created, text, tokens, "completed") });
+        try { res.write("data: [DONE]\n\n"); res.end(); } catch {}
+        writeProof({ path: pathTag, sessionID, model, ms: Date.now() - t0, chars: text.length, tokens, rotator: readRotatorTail(3), sample: text.slice(0, 160) });
+        finish(null);
+      }
+
       function flushAndFinish() {
         if (settled) return;
-        // If idle fired but no text yet, wait up to 2s for late-arriving deltas
-        // (SSE race: session.idle can arrive before message.part.delta over the stream)
+        // Idle fired but no deltas arrived via SSE — fetch the text directly from serve
         if (fullText === "") {
-          setTimeout(() => {
-            if (settled) return;
-            if (fullText === "") {
-              console.error("Zen Bridge: idle-before-delta for", model, "— no text after 2s wait, closing with error");
-              finish(new Error("idle-with-no-text"));
-            } else {
-              flushAndFinish(); // text arrived during the wait — flush normally
-            }
-          }, 2000);
+          callServe("GET", `/session/${sessionID}/message`, null, 8000)
+            .then(async (r) => {
+              if (settled) return;
+              if (r.status === 200) {
+                const got = extractAssistantText(r.json);
+                if (got.text) { fullText = got.text; if (got.tokens) tokens = got.tokens; }
+              }
+              if (fullText === "") {
+                console.error("Zen Bridge: idle-no-delta for", model, "— recovering via sync/big-pickle");
+                const recovered = await recoverTextAfterEmpty(model, chatBody);
+                if (recovered && recovered.text) {
+                  fullText = recovered.text;
+                  if (recovered.tokens) tokens = recovered.tokens;
+                  emitResponsesText(fullText, recovered.path);
+                  return;
+                }
+                console.error("Zen Bridge: idle-no-delta for", model, "— recovery also empty");
+                finish(new Error("idle-with-no-text"));
+              } else {
+                emitResponsesText(fullText, "zen-responses-fetched");
+              }
+            })
+            .catch((e) => {
+              if (!settled) finish(new Error("fetch-after-idle failed: " + e.message));
+            });
           return;
         }
         try {
@@ -521,24 +600,45 @@ function zenStreamToClient(res, model, body, timeoutMs) {
 
         if (isIdle) {
           clearTimeout(timer); clearInterval(stallCheck);
-          // Idle-before-delta race: wait up to 2s for late-arriving deltas before giving up
+          // Idle fired with no deltas — fetch text directly from serve session messages
           if (fullText === "") {
-            setTimeout(() => {
-              if (settled) return;
-              if (fullText === "") {
-                console.error("Zen Bridge: idle-before-delta for", model, "— no text after 2s wait, error response");
-                finish(new Error("idle-with-no-text"));
-              } else {
-                // Text arrived during wait — close normally
-                try {
-                  res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
-                  res.write("data: [DONE]\n\n");
-                  res.end();
-                } catch {}
-                writeProof({ path: "zen-stream", sessionID, model, ms: Date.now() - t0, chars: fullText.length, tokens, rotator: readRotatorTail(3), sample: fullText.slice(0, 160) });
-                finish(null);
-              }
-            }, 2000);
+            callServe("GET", `/session/${sessionID}/message`, null, 8000)
+              .then(async (r) => {
+                if (settled) return;
+                if (r.status === 200) {
+                  const got = extractAssistantText(r.json);
+                  if (got.text) { fullText = got.text; if (got.tokens) tokens = got.tokens; }
+                }
+                if (fullText === "") {
+                  console.error("Zen Bridge: idle-no-delta for", model, "— recovering via sync/big-pickle");
+                  const recovered = await recoverTextAfterEmpty(model, body);
+                  if (recovered && recovered.text) {
+                    fullText = recovered.text;
+                    if (recovered.tokens) tokens = recovered.tokens;
+                    try {
+                      res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: fullText }, finish_reason: null }] })}\n\n`);
+                      res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+                      res.write("data: [DONE]\n\n");
+                      res.end();
+                    } catch {}
+                    writeProof({ path: recovered.path, sessionID, model, ms: Date.now() - t0, chars: fullText.length, tokens, rotator: readRotatorTail(3), sample: fullText.slice(0, 160) });
+                    finish(null);
+                    return;
+                  }
+                  console.error("Zen Bridge: idle-no-delta for", model, "— recovery also empty");
+                  finish(new Error("idle-with-no-text"));
+                } else {
+                  try {
+                    res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: fullText }, finish_reason: null }] })}\n\n`);
+                    res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+                    res.write("data: [DONE]\n\n");
+                    res.end();
+                  } catch {}
+                  writeProof({ path: "zen-stream-fetched", sessionID, model, ms: Date.now() - t0, chars: fullText.length, tokens, rotator: readRotatorTail(3), sample: fullText.slice(0, 160) });
+                  finish(null);
+                }
+              })
+              .catch((e) => { if (!settled) finish(new Error("fetch-after-idle failed: " + e.message)); });
             return;
           }
           try {
@@ -632,21 +732,23 @@ async function handleChat(res, body, stream) {
 
   try {
     const zenTimeout = (remapped || !FAST_ZEN.has(requested)) ? ZEN_REMAP_TIMEOUT_MS : ZEN_TIMEOUT_MS;
-    const meta = await tryZen(requested, remapped ? "zen-remap" : "zen-live", zenTimeout);
+    // Use the resolved zen model directly — don't try an unknown model name first
+    const modelToTry = remapped ? zenModel : requested;
+    const meta = await tryZen(modelToTry, remapped ? "zen-remap" : "zen-live", zenTimeout);
     return meta;
   } catch (e1) {
     if (stream && res.headersSent)
       return { path: "zen-stream-partial", model: zenModel, requested, remapped, streamErr: e1.message };
 
-    // Try the remapped live model if different
-    if (zenModel !== requested) {
+    // Try big-pickle as last resort if zenModel itself failed
+    if (zenModel !== "big-pickle") {
       try {
-        console.error("Zen Bridge: exact failed for", requested, "-> remap", zenModel, e1.message);
-        return await tryZen(zenModel, "zen-remap");
+        console.error("Zen Bridge:", zenModel, "failed -> big-pickle fallback:", e1.message);
+        return await tryZen("big-pickle", "zen-bigpickle-fallback");
       } catch (e2) {
-        console.error("Zen Bridge: remap also failed:", e2.message);
+        console.error("Zen Bridge: big-pickle fallback also failed:", e2.message);
         if (stream && res.headersSent)
-          return { path: "zen-remap-partial", model: zenModel, requested, remapped, streamErr: e2.message };
+          return { path: "zen-remap-partial", model: "big-pickle", requested, remapped, streamErr: e2.message };
       }
     }
 
@@ -664,7 +766,7 @@ async function handleChat(res, body, stream) {
 // ── HTTP server ───────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   res.on("error", () => {});
-  const urlPath = (req.url || "/").split("?")[0];
+  const urlPath = normalizeBridgePath(req.url || "/");
 
   if ((urlPath === "/v1/models" || urlPath === "/models") && req.method === "GET") {
     const models = [
@@ -734,8 +836,8 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── /v1/responses — OpenAI Responses API ──────────────────────────────────
-  if (urlPath === "/v1/responses" && req.method === "POST") {
+  // ── /v1/responses — OpenAI Responses API (plus common client path variants) ──
+  if ((urlPath === "/v1/responses" || urlPath === "/responses") && req.method === "POST") {
     let chunks = "";
     const started = Date.now();
     req.on("data", (c) => { chunks += c; });
@@ -760,20 +862,22 @@ const server = http.createServer((req, res) => {
         };
 
         const zenRespTimeout = FAST_ZEN.has(resolved.requested) ? ZEN_TIMEOUT_MS : ZEN_REMAP_TIMEOUT_MS;
+        // Use the resolved zen model directly — no point trying the original name if it's remapped
+        const modelToTry = resolved.remapped ? zenModel : resolved.requested;
 
         try {
-          return await tryZenResponses(resolved.requested, zenRespTimeout);
+          return await tryZenResponses(modelToTry, zenRespTimeout);
         } catch (e1) {
           if (streamReq && res.headersSent)
             return { path: "zen-responses-partial", model: zenModel, streamErr: e1.message };
 
-          // Remap fallback
-          if (zenModel !== resolved.requested) {
+          // If we tried the remap target and it failed, try big-pickle as last resort
+          if (modelToTry !== "big-pickle") {
             try {
-              console.error("Zen Bridge /v1/responses: exact failed for", resolved.requested, "-> remap", zenModel, e1.message);
-              return await tryZenResponses(zenModel);
+              console.error("Zen Bridge /v1/responses:", modelToTry, "failed -> big-pickle fallback:", e1.message);
+              return await tryZenResponses("big-pickle");
             } catch (e2) {
-              console.error("Zen Bridge /v1/responses remap failed:", e2.message);
+              console.error("Zen Bridge /v1/responses big-pickle fallback failed:", e2.message);
             }
           }
 

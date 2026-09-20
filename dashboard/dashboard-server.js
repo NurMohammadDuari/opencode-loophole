@@ -13,26 +13,32 @@ const DB_PATH = process.env.OPENCODE_DB || path.join(HOME, ".local", "share", "o
 // Prefer that live path; fall back to the standard path if it doesn't exist.
 const _ACTIVITY_STANDARD = path.join(HOME, ".local", "share", "opencode", "bridge-activity.jsonl");
 const _ACTIVITY_SERVEHOME = path.join(HOME, ".local", "share", "opencode", "servehome", ".local", "share", "opencode", "bridge-activity.jsonl");
+// FIX: called per-request (not once at startup) so it always finds the live file
+// even if it was created after the dashboard process started.
 function resolveActivityLog() {
   if (process.env.BRIDGE_ACTIVITY_LOG) return process.env.BRIDGE_ACTIVITY_LOG;
-  // Return whichever file is newer (has the most recent writes)
-  try {
-    const s = fs.statSync(_ACTIVITY_SERVEHOME);
-    const t = fs.existsSync(_ACTIVITY_STANDARD) ? fs.statSync(_ACTIVITY_STANDARD).mtimeMs : 0;
-    return s.mtimeMs >= t ? _ACTIVITY_SERVEHOME : _ACTIVITY_STANDARD;
-  } catch { return _ACTIVITY_STANDARD; }
+  // Return whichever file exists and is newer
+  const shExists = fs.existsSync(_ACTIVITY_SERVEHOME);
+  const stExists = fs.existsSync(_ACTIVITY_STANDARD);
+  if (shExists && stExists) {
+    const shMtime = fs.statSync(_ACTIVITY_SERVEHOME).mtimeMs;
+    const stMtime = fs.statSync(_ACTIVITY_STANDARD).mtimeMs;
+    return shMtime >= stMtime ? _ACTIVITY_SERVEHOME : _ACTIVITY_STANDARD;
+  }
+  if (shExists) return _ACTIVITY_SERVEHOME;
+  if (stExists) return _ACTIVITY_STANDARD;
+  // Neither exists yet — return servehome path so it's consistent with bridge
+  return _ACTIVITY_SERVEHOME;
 }
-const ACTIVITY_LOG = resolveActivityLog();
+// Note: ACTIVITY_LOG is NOT cached at module level — always call resolveActivityLog()
 
 const SERVICES = [
   { name: "bridge", label: "Zen Bridge", port: 1343, unit: "zen-bridge.service", healthUrl: "http://127.0.0.1:1343/health",
-    desc: "OpenAI /v1/chat/completions -> local serve session API" },
+    desc: "OpenAI /v1/chat/completions + /v1/responses -> local serve session API" },
   { name: "serve", label: "OpenCode Serve", port: 18765, unit: "opencode-serve.service", healthUrl: "",
     desc: "Real OpenCode client session (passes the zen Console gate)" },
   { name: "rotator", label: "Zen Rotator", port: 1341, unit: "zen-rotator.service", healthUrl: "",
     desc: "Rotates x-real-ip per request = fresh per-IP daily bucket = unlimited" },
-  { name: "g4f", label: "g4f Mirror Pool", port: 1337, unit: "g4f-api.service", healthUrl: "http://127.0.0.1:1337/v1/models",
-    desc: "Free LLM mirror pool (localhost:1337)" },
 ];
 
 function probePort(port, timeout = 600) {
@@ -314,8 +320,7 @@ const server = http.createServer(async (req, res) => {
       const r1 = sysctl("zen-rotator.service", "restart");
       const r2 = sysctl("opencode-serve.service", "restart");
       const r3 = sysctl("zen-bridge.service", "restart");
-      const r4 = sysctl("g4f-api.service", "restart");
-      return sendJson(res, 200, { ok: r1.ok && r2.ok && r3.ok && r4.ok, msg: "All loophole services restarted" });
+      return sendJson(res, 200, { ok: r1.ok && r2.ok && r3.ok, msg: "All loophole services restarted (zen only, no g4f)" });
     }
     if (p === "/api/test-chain" && req.method === "POST") {
       let body = "";

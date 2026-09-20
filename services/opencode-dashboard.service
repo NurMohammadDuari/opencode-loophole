@@ -1,7 +1,7 @@
 [Unit]
 Description=OpenCode Loophole Control Dashboard Server
-After=zen-bridge.service g4f-api.service
-Wants=zen-bridge.service g4f-api.service
+After=zen-bridge.service
+Wants=zen-bridge.service
 
 [Service]
 Type=simple
