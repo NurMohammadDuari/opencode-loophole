@@ -3,12 +3,19 @@
 let streamRunning = false;
 let es = null;
 
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 function formatEntry(en) {
   const time   = new Date(en.ts).toLocaleTimeString();
   const model  = en.resolved || en.model || '?';
   const type   = en.stream ? '[SSE]' : '[JSON]';
   const status = en.status != null ? en.status : '?';
-  const ms     = en.ms   != null ? en.ms + 'ms' : '';
+  const ms     = en.ms != null ? en.ms + 'ms' : '';
   const err    = en.error ? ' ERR:' + en.error : '';
   const pth    = 'path=' + (en.path != null ? en.path : '–');
   return `${time} ${model} ${type} ${status} ${ms}${err} ${pth}`;
@@ -16,20 +23,15 @@ function formatEntry(en) {
 
 function renderLog(entries) {
   const log = document.getElementById('streamlog');
-  // Build colored HTML so errors stand out
   const html = entries.map((en) => {
     const line = formatEntry(en);
-    const isErr = en.status !== 200 || en.error;
+    const isErr = en.status !== 200 || !!en.error;
     return isErr
-      ? `<span style="color:#cc3333">${escHtml(line)}</span>`
+      ? '<span style="color:#cc3333">' + escHtml(line) + '</span>'
       : escHtml(line);
   }).join('\n');
   log.innerHTML = html;
   log.scrollTop = log.scrollHeight;
-}
-
-function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 function toggleStream() {
@@ -58,6 +60,7 @@ function toggleStream() {
       const b = document.getElementById('streamBtn');
       b.textContent = '▶ Start Stream';
       b.className = 'btn';
+      // no alert – silently reset so user can click Start again
     };
   } else {
     btn.textContent = '▶ Start Stream';
@@ -73,5 +76,5 @@ function updateClock() {
 setInterval(updateClock, 1000);
 updateClock();
 
-// Auto-start the SSE stream; toggleStream flips button to running state
+// Auto-start stream on load
 document.addEventListener('DOMContentLoaded', () => { toggleStream(); });

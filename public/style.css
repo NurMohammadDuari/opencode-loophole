@@ -21,6 +21,7 @@ h1, h2 {
   padding: 10px;
   margin-top: 10px;
 }
+/* Log box: div with preserved whitespace so colored spans render correctly */
 .log {
   background: #f8f8f8;
   border: 1px solid #000;
@@ -54,7 +55,7 @@ button, .btn {
 button:active, .btn:active {
   border-style: inset;
 }
-/* Stop button – red tint so it's visually distinct */
+/* Stop button – red so it's visually distinct from Start */
 .btn.off {
   background: #cc3333;
   color: #fff;
