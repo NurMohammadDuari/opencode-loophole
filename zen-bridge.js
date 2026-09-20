@@ -594,6 +594,9 @@ async function zenResponsesOnce(model, chatBody) {
   const respId = "resp_" + (openaiRes.id || crypto.randomBytes(12).toString("hex")).replace(/^chatcmpl-/, "");
   const tok = openaiRes.usage;
   return {
+    tokens: tok
+      ? { input: tok.prompt_tokens || 0, output: tok.completion_tokens || 0, total: tok.total_tokens || 0, reasoning: 0, cache: { write: 0, read: 0 } }
+      : null,
     responsesObj: {
       id: respId, object: "response", created_at: created, model, status: "completed",
       output: [{ type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text, annotations: [] }], status: "completed" }],
@@ -889,8 +892,9 @@ async function zenOnce(model, body, timeoutOverride) {
         : undefined,
       system_fingerprint: sessionID,
     };
-    writeProof({ path: "zen-sync", sessionID, model, tokens: msg.json.info && msg.json.info.tokens, rotator: readRotatorTail(3), sample: text.slice(0, 160) });
-    return { openaiRes, sessionID, path: "zen-sync" };
+    const toks = (msg.json.info && msg.json.info.tokens) || null;
+    writeProof({ path: "zen-sync", sessionID, model, tokens: toks, rotator: readRotatorTail(3), sample: text.slice(0, 160) });
+    return { openaiRes, sessionID, path: "zen-sync", tokens: toks, inChars: messagesCharCount(chatBody && chatBody.messages), outChars: text.length };
   } finally {
     // Give serve time to fully release the run before deleting — an immediate
     // DELETE triggered SQLite FOREIGN KEY constraint failures in serve.
@@ -919,7 +923,7 @@ async function handleChat(res, body, stream) {
       ...proofHeaders({ "x-loophole-path": tag, "x-loophole-session": result.sessionID || "", "x-loophole-model": model, "x-loophole-requested": requested, "x-loophole-remapped": model !== requested ? "1" : "0" }),
     });
     res.end(JSON.stringify(result.openaiRes));
-    return { path: tag, model, requested, remapped: model !== requested };
+    return { path: tag, model, requested, remapped: model !== requested, tokens: result.tokens, inChars: result.inChars, outChars: result.outChars };
   };
 
   try {
@@ -1017,10 +1021,10 @@ const server = http.createServer((req, res) => {
       const t0 = Date.now();
       handleChat(res, body, streamReq)
         .then((meta) => {
-          logActivity({ event: "completion", model, resolved: meta && meta.model, path: meta && meta.path, stream: streamReq, status: 200, ms: Date.now() - t0, reqMs: t0 - started, real: true });
+          logActivity({ event: "completion", model, resolved: meta && meta.model, path: meta && meta.path, stream: streamReq, status: 200, ms: Date.now() - t0, reqMs: t0 - started, inChars: messagesCharCount(body && body.messages), outChars: meta && meta.outChars != null ? meta.outChars : (meta && meta.text ? String(meta.text).length : 0), tokens: (meta && meta.tokens) || null, real: true });
         })
         .catch((e) => {
-          logActivity({ event: "completion", model, stream: streamReq, status: e.status || 500, ms: Date.now() - t0, reqMs: t0 - started, error: e.message, real: true });
+          logActivity({ event: "completion", model, stream: streamReq, status: e.status || 500, ms: Date.now() - t0, reqMs: t0 - started, inChars: messagesCharCount(body && body.messages), error: e.message, real: true });
           if (!res.headersSent) {
             res.writeHead(e.status || 500, { "Content-Type": "application/json", ...proofHeaders() });
             res.end(JSON.stringify({ error: { message: "bridge: " + e.message } }));
@@ -1107,10 +1111,10 @@ const server = http.createServer((req, res) => {
 
       doRequest()
         .then((meta) => {
-          logActivity({ event: "completion", api: "responses", model, resolved: meta && meta.model, path: meta && meta.path, stream: streamReq, status: 200, ms: Date.now() - t0, reqMs: t0 - started, real: true });
+          logActivity({ event: "completion", api: "responses", model, resolved: meta && meta.model, path: meta && meta.path, stream: streamReq, status: 200, ms: Date.now() - t0, reqMs: t0 - started, inChars: messagesCharCount(chatBody && chatBody.messages), outChars: meta && meta.text ? String(meta.text).length : 0, tokens: (meta && meta.tokens) || null, real: true });
         })
         .catch((e) => {
-          logActivity({ event: "completion", api: "responses", model, stream: streamReq, status: e.status || 500, ms: Date.now() - t0, reqMs: t0 - started, error: e.message, real: true });
+          logActivity({ event: "completion", api: "responses", model, stream: streamReq, status: e.status || 500, ms: Date.now() - t0, reqMs: t0 - started, inChars: messagesCharCount(chatBody && chatBody.messages), error: e.message, real: true });
           if (!res.headersSent) {
             res.writeHead(e.status || 500, { "Content-Type": "application/json", ...proofHeaders() });
             res.end(JSON.stringify({ error: { message: "bridge: " + e.message } }));

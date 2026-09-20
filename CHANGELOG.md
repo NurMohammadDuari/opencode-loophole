@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-20d — Realtime usage dashboard + g4f fully removed
+
+- Bridge now logs tokens (input/output/total/reasoning/cache) and context chars
+  (in/out) for every completion, streamed and non-streamed
+- Dashboard rebuilt as a realtime control center: usage cards, 30-minute activity
+  chart, live completion stream with per-request token/context details, per-model
+  usage leaderboard, service controls with journalctl logs, chain tester,
+  sessions viewer (read-only opencode.db), and the rotator proof log
+- One SSE channel feeds everything; efficient tail-follow reading replaces
+  full-file re-reads; usage totals survive dashboard restarts via log replay
+- Model-name normalization so `opencode/…` prefixes no longer split stats
+- CSRF origin check on service-control endpoints
+- Removed g4f entirely: service file deleted, dropped from dashboard, README
+  and install steps; zen-only fallback (smaller body → big-pickle) documented
+- Verified live end-to-end: JSON + SSE completions, token capture
+  (e.g. in 6479 / out 3 / total 8274), service controls, proof viewer
+
 ## 2026-09-20c — Desktop blank output / endless "thinking" fixed at the root
 
 Root cause: the bridge aborted healthy agent runs on fixed timers, then deleted the

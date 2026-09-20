@@ -3,31 +3,69 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>OpenCode Loophole Dashboard</title>
-  <link rel="stylesheet" href="style.css?v=6" />
+  <title>OpenCode Loophole Control Center</title>
+  <link rel="stylesheet" href="style.css?v=7" />
 </head>
 <body>
   <div class="top-bar">
     <h1>OpenCode Loophole Control Center</h1>
-    <div id="clock" class="mini mono"></div>
+    <div class="top-right">
+      <span id="conn-dot" class="dot off" title="SSE connection"></span>
+      <span id="clock" class="mini mono"></span>
+    </div>
   </div>
 
+  <!-- ══ REALTIME USAGE CARDS ══ -->
+  <section class="cards" id="usage-cards">
+    <div class="card"><div class="k">Requests</div><div class="v" id="u-req">0</div><div class="s" id="u-req-min">0/min</div></div>
+    <div class="card ok"><div class="k">OK</div><div class="v" id="u-ok">0</div><div class="s" id="u-rate">100%</div></div>
+    <div class="card err"><div class="k">Failed</div><div class="v" id="u-fail">0</div><div class="s" id="u-avg">&nbsp;</div></div>
+    <div class="card tok"><div class="k">Tokens In</div><div class="v" id="u-intok">0</div><div class="s" id="u-inchars">0 chars sent</div></div>
+    <div class="card tok"><div class="k">Tokens Out</div><div class="v" id="u-outtok">0</div><div class="s" id="u-outchars">0 chars received</div></div>
+    <div class="card tok"><div class="k">Total Tokens</div><div class="v" id="u-tok">0</div><div class="s" id="u-avgms">avg –</div></div>
+  </section>
+
+  <!-- ══ 30-MIN CHART ══ -->
   <section class="panel">
-    <h2>Live Stream (real‑time bridge completions)</h2>
+    <h2>Activity — last 30 min <span class="dim" id="chart-note">(requests/min, red = failures)</span></h2>
+    <div id="chart" class="chart"></div>
+  </section>
+
+  <!-- ══ LIVE STREAM ══ -->
+  <section class="panel">
+    <h2>Live Completions <span class="dim">(realtime from bridge)</span></h2>
     <div class="controls">
-      <button class="btn" id="streamBtn" onclick="toggleStream()">▶ Start Stream</button>
+      <button class="btn" id="streamBtn" onclick="toggleStream()">■ Stop Stream</button>
+      <span class="dim mono" id="stream-note">auto-reconnect every 3s</span>
     </div>
-    <div id="streamlog" class="log">Waiting for stream…</div>
-    <div class="kv">
-      <span class="dim">Last Completion Path</span>
-      <b id="pipeline-path" class="mono">–</b>
-    </div>
-    <div class="kv">
-      <span class="dim">Last Model / Sample</span>
-      <b id="pipeline-model" class="mono">–</b>
+    <div class="log-wrap">
+      <div id="streamlog" class="log">Waiting for completions…</div>
+      <div id="last-detail" class="last-detail mono"></div>
     </div>
   </section>
 
+  <!-- ══ SERVICES ══ -->
+  <section class="panel">
+    <h2>Services <span class="dim">(all 5 units)</span></h2>
+    <div class="controls">
+      <button class="btn" onclick="restartAll()">↻ Restart Zen Chain</button>
+      <button class="btn" onclick="loadSessions()">▤ Sessions</button>
+      <button class="btn" onclick="loadProof()">✔ Proof</button>
+    </div>
+    <div id="svc-list"></div>
+  </section>
+
+  <!-- ══ CHAIN TEST ══ -->
+  <section class="panel">
+    <h2>Chain Test <span class="dim">(fires a real completion through the bridge)</span></h2>
+    <div class="controls">
+      <input id="test-model" type="text" value="big-pickle" class="mono filter-input" />
+      <button class="btn" onclick="runTest()">▶ Test</button>
+      <span id="test-result" class="mono"></span>
+    </div>
+  </section>
+
+  <!-- ══ MODELS ══ -->
   <section class="panel">
     <h2>Free Models <span id="model-count" class="dim">(loading…)</span></h2>
     <div class="controls">
@@ -37,6 +75,30 @@
     <div id="model-list" class="model-grid">Loading…</div>
   </section>
 
-  <script src="app.js?v=6"></script>
+  <!-- ══ MODEL LEADERBOARD ══ -->
+  <section class="panel">
+    <h2>Usage by Model <span class="dim">(requests · tokens in/out · avg ms)</span></h2>
+    <div id="model-stats" class="stats-table">No data yet.</div>
+  </section>
+
+  <!-- ══ SESSIONS ══ -->
+  <section class="panel" id="panel-sessions" hidden>
+    <h2>Sessions <span class="dim">(read-only, from opencode.db)</span></h2>
+    <div id="session-list" class="stats-table">Loading…</div>
+  </section>
+
+  <!-- ══ LOGS ══ -->
+  <section class="panel" id="panel-logs" hidden>
+    <h2>Service Logs <span class="dim mono" id="logs-unit"></span></h2>
+    <pre id="logs-view" class="log">–</pre>
+  </section>
+
+  <!-- ══ PROOF ══ -->
+  <section class="panel" id="panel-proof" hidden>
+    <h2>Loophole Proof <span class="dim">(bridge + rotator logs)</span></h2>
+    <div id="proof-view" class="stats-table mono">–</div>
+  </section>
+
+  <script src="app.js?v=7"></script>
 </body>
 </html>

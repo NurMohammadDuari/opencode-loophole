@@ -1,84 +1,59 @@
-### How to view the dashboard page
+# Dashboard — http://127.0.0.1:1395/
 
-1. **Start the dashboard server**  
-   The server is the Node script `dashboard/dashboard-server.js`.  
-   You can run it **manual​ly** (good for a quick test) or **as a system service** (so it starts automatically on boot).
+The dashboard is the realtime control center for the whole bridge chain.
+Everything updates live over a single SSE connection (no page reloads).
 
-   **A. Quick‑test (manual start)**
-   ```bash
-   cd /home/mint/Desktop/opencode-zen-loophole
-   # make sure Node is on your PATH
-   node dashboard/dashboard-server.js
-   ```
-   You should see a line like:
-   ```
-   Server listening on http://127.0.0.1:1395
-   ```
-   Leave that terminal window running.
+## Quick start
 
-   **B. System‑wide service (runs on boot, requires sudo)**
-   1. Create the service unit (run once):
-      ```bash
-      sudo tee /etc/systemd/system/opencode-dashboard.service > /dev/null <<'EOF'
-      [Unit]
-      Description=OpenCode Zen Loophole Dashboard
-      After=network.target
+```bash
+# If installed as a user service (recommended):
+systemctl --user status opencode-dashboard.service
+xdg-open http://127.0.0.1:1395/
 
-      [Service]
-      Type=simple
-      WorkingDirectory=/home/mint/Desktop/opencode-zen-loophole
-      ExecStart=/usr/bin/node dashboard/dashboard-server.js
-      Restart=on-failure
-      # optional: limit resources, set user/group if desired
-      # User=mint
-      # Group=mint
+# Or run it manually from the repo:
+node dashboard/dashboard-server.js
+```
 
-      [Install]
-      WantedBy=multi-user.target
-      EOF
-      ```
+## What you get
 
-   2. Reload systemd, enable and start the service:
-      ```bash
-      sudo systemctl daemon-reload
-      sudo systemctl enable --now opencode-dashboard.service
-      ```
+| Panel | What it shows / does |
+|-------|----------------------|
+| **Usage cards** | Requests, OK, Failed, Tokens In, Tokens Out, Total Tokens — plus req/min, success rate, avg latency, chars sent/received |
+| **Activity chart** | Bar chart of the last 30 minutes (requests/min; red bars = minutes with failures, hover for details) |
+| **Live Completions** | Every request as it finishes: model, `[JSON]`/`[SSE]`/`[RESP]` tag, status, duration, **tokens in→out**, **context chars in›out**, path (zen-live / zen-sync / recovery), errors. A detail card breaks down the newest request |
+| **Services** | All zen units with live status dots, PID, port, health — with restart / stop / start / log buttons per unit, plus a "Restart Zen Chain" button |
+| **Chain Test** | Fires a real completion through the bridge for any model and shows OK/FAIL + latency. Click any model badge to test it |
+| **Free Models** | Live list from the bridge (`/v1/models`) with filter |
+| **Usage by Model** | Leaderboard: requests, failures, tokens in/out, average time, last used — per model |
+| **Sessions** | Recent OpenCode sessions read read-only from `opencode.db` (title, model, token totals, updated) |
+| **Logs** | `journalctl --user` output per service inside the page |
+| **Proof** | Last bridge proof + recent rotator log entries, including the rotated `x-real-ip` addresses |
 
-   3. Verify it’s running:
-      ```bash
-      sudo systemctl status opencode-dashboard.service
-      ```
-      You should see **active (running)** and the same “Server listening...” line in the journal:
-      ```bash
-      journalctl -u opencode-dashboard.service -f
-      ```
+## REST API (all on :1395)
 
-2. **Open the UI in a browser**
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/stream` | GET (SSE) | Everything: usage, status, new completions (2s), system (10s) |
+| `/api/usage` | GET | Aggregate usage: totals, per-minute buckets (30), per-model stats, last 50 entries |
+| `/api/activity` | GET | Last 300 raw activity entries + usage snapshot |
+| `/api/status` | GET | Service probe + systemd state + bridge health |
+| `/api/system` | GET | Host info (load, memory, uptime, Node version) |
+| `/api/sessions?limit=20` | GET | Recent OpenCode sessions (read-only SQLite) |
+| `/api/session/:id` | GET | Message parts of one session |
+| `/api/logs/:unit?n=200` | GET | journalctl logs for a unit |
+| `/api/service/:unit/:action` | POST | start / stop / restart (localhost + same-origin only) |
+| `/api/restart-all` | POST | Restart rotator + serve + bridge |
+| `/api/test-chain` | POST | `{ "model": "big-pickle" }` → real completion through the bridge |
+| `/api/proof` | GET | Bridge proof file + rotator proof log |
+| `/v1/models` | GET | Proxied from the bridge |
 
-   Once the server is running, open any web browser (Chrome, Firefox, etc.) and go to:
+## Troubleshooting
 
-   ```
-   http://127.0.0.1:1395/
-   ```
-
-   - The page will load the **90s‑style UI** automatically.
-   - The stream starts on page load (the button is now just decorative because the script auto‑connects to `/api/stream`).
-
-3. **Optional: Stop the service**
-
-   - If you used the manual start, just press `Ctrl‑C` in the terminal.
-   - If you used the system service:
-     ```bash
-     sudo systemctl stop opencode-dashboard.service
-     ```
-
-4. **Troubleshooting tips**
-
-   | Symptom                              | Check / Fix |
-   |--------------------------------------|-------------|
-   | `node: command not found`            | Install Node (`sudo apt install nodejs npm` or use a version manager). |
-   | Port 1395 already in use            | Ensure no other instance is running: `sudo lsof -i:1395` and kill it, or change the port in `dashboard/dashboard-server.js`. |
-   | Service fails to start               | View logs: `journalctl -u opencode-dashboard.service -b`. |
-   | Page shows “Waiting for stream…”    | Verify the server logs show `EventSource` connections; the `app.js` script auto‑connects on load. |
-
-That’s all you need. After the service is up, just navigate to `http://127.0.0.1:1395/` and you’ll see the retro‑styled control center with live telemetry. Let me know if you encounter any issues or want to tweak the service (e.g., run it under the `mint` user instead of root).
+| Symptom | Check / Fix |
+|---------|-------------|
+| `node: command not found` | Install Node (`sudo apt install nodejs npm` or use nvm). |
+| Port 1395 already in use | `ss -tlnp \| grep 1395`, kill the stale process or change `DASHBOARD_PORT`. |
+| Service fails to start | `journalctl --user -u opencode-dashboard.service -b`. |
+| Connection dot red / "Waiting for stream…" | The UI auto-reconnects every 3s; check that the dashboard service is running. |
+| Token counters are 0 for old history | The bridge only started logging tokens recently — counters build up from now on. |
+| Stats reset after dashboard restart | Recent history is replayed from `bridge-activity.jsonl` at startup; older entries beyond the replay window are not counted. |

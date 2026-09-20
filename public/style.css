@@ -18,40 +18,108 @@ h1, h2 {
   align-items: center;
   justify-content: space-between;
 }
+.top-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sys {
+  font-size: 11px;
+  color: #333;
+}
+
+/* ── status dots ── */
+.dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1px solid #000;
+  vertical-align: middle;
+}
+.dot.on { background: #2db82d; }
+.dot.off { background: #cc3333; }
+
+/* ── usage cards ── */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+.card {
+  border: 2px solid #000;
+  background: #e8e8e8;
+  padding: 8px 10px;
+}
+.card .k {
+  font-size: 11px;
+  color: #555;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.card .v {
+  font-size: 26px;
+  font-weight: bold;
+  font-family: "Courier New", Courier, monospace;
+}
+.card .s {
+  font-size: 11px;
+  color: #555;
+}
+.card.ok { background: #d8f0d8; }
+.card.err { background: #f0d8d8; }
+.card.tok { background: #d8e4f0; }
+
+/* ── panels ── */
 .panel {
   border: 2px solid #000;
   background: #e0e0e0;
   padding: 10px;
   margin-top: 10px;
 }
-/* Log box: div with preserved whitespace so colored spans render correctly */
+/* Log box: preserved whitespace so colored spans render correctly */
 .log {
   background: #f8f8f8;
   border: 1px solid #000;
-  height: 200px;
+  height: 220px;
   overflow: auto;
-  font-size: 14px;
+  font-size: 13px;
   white-space: pre;
   font-family: "Courier New", Courier, monospace;
   padding: 4px;
 }
+.log-wrap {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 8px;
+}
+.last-detail {
+  border: 1px solid #000;
+  background: #fdf6d8;
+  padding: 8px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.last-detail .t { color: #0a4d8c; font-weight: bold; }
 .kv {
   margin-top: 5px;
   font-size: 12px;
 }
-.mono {
-  font-family: "Courier New", Courier, monospace;
-}
+.mono { font-family: "Courier New", Courier, monospace; }
 .dim {
   color: #555;
   font-size: 12px;
   font-weight: normal;
 }
+.e { color: #cc3333; }
+.good { color: #1a7a1a; font-weight: bold; }
 .controls {
   margin-bottom: 6px;
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
 }
 button, .btn {
   background: #c0c0c0;
@@ -64,7 +132,6 @@ button, .btn {
 button:active, .btn:active {
   border-style: inset;
 }
-/* Stop button – red so it's visually distinct from Start */
 .btn.off {
   background: #cc3333;
   color: #fff;
@@ -74,7 +141,11 @@ button:active, .btn:active {
   border-style: inset;
   background: #aa2222;
 }
-/* Models panel */
+.btn.xs {
+  padding: 1px 6px;
+  font-size: 11px;
+  margin-left: 3px;
+}
 .filter-input {
   border: 2px inset #999;
   padding: 3px 6px;
@@ -82,6 +153,25 @@ button:active, .btn:active {
   width: 160px;
   background: #fff;
 }
+
+/* ── chart ── */
+.chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 90px;
+  background: #f8f8f8;
+  border: 1px solid #000;
+  padding: 4px;
+}
+.chart .bar {
+  flex: 1;
+  background: #4a7ec4;
+  min-height: 2px;
+}
+.chart .bar.bad { background: #cc3333; }
+
+/* ── models grid ── */
 .model-grid {
   display: flex;
   flex-wrap: wrap;
@@ -97,12 +187,60 @@ button:active, .btn:active {
   padding: 2px 7px;
   font-size: 12px;
   font-family: "Courier New", Courier, monospace;
-  cursor: default;
+  cursor: pointer;
   white-space: nowrap;
 }
-/* live/free models get a green tint */
+.model-badge:hover { background: #b8d8f8; }
 .model-badge.live {
   background: #c8f0c8;
   border-color: #4a9a4a;
   color: #1a5a1a;
+}
+
+/* ── stats tables ── */
+.stats-table table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  background: #f8f8f8;
+}
+.stats-table th, .stats-table td {
+  border: 1px solid #aaa;
+  padding: 3px 6px;
+  text-align: left;
+}
+.stats-table th {
+  background: #c0c0c0;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+.stats-table td.t { color: #0a4d8c; }
+.proof-head {
+  background: #fdf6d8;
+  border: 1px solid #000;
+  padding: 6px;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+/* ── services ── */
+.svc {
+  border: 1px solid #999;
+  background: #f4f4f4;
+  padding: 6px 8px;
+  margin-bottom: 4px;
+  display: grid;
+  grid-template-columns: 14px 1fr auto;
+  gap: 6px;
+  align-items: center;
+  font-size: 13px;
+}
+.svc.ok { border-left: 5px solid #2db82d; }
+.svc.bad { border-left: 5px solid #cc3333; }
+.svc .desc { font-size: 11px; }
+.svc-btns { white-space: nowrap; }
+.svc .dot { width: 8px; height: 8px; }
+
+@media (max-width: 720px) {
+  .log-wrap { grid-template-columns: 1fr; }
 }

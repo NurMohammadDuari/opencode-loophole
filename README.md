@@ -17,7 +17,7 @@ This project removes that limit by:
 2. Wrapping every request in a real OpenCode client session
 3. Spoofing a fresh random IP address on every single request so the rate limiter never triggers
 
-The result: **unlimited free access** to 40 AI models from any tool that supports a custom API base URL (OpenCode, Cursor, VS Code extensions, aider, etc.)
+The result: **unlimited free access** to 31 AI models from any tool that supports a custom API base URL (OpenCode, Cursor, VS Code extensions, aider, etc.)
 
 ---
 
@@ -60,8 +60,7 @@ Your AI tool  (opencode, cursor, aider, etc.)
          (the actual free AI models)
 ```
 
-If the zen path fails for any reason, requests automatically fall back to:
-- **g4f mirror pool** (port 1337) — 7 extra free models via local mirror
+If the zen path fails for a model, the bridge automatically recovers with a smaller request body and falls back to `big-pickle` — no external fallback service needed.
 
 ---
 
@@ -102,17 +101,6 @@ If the zen path fails for any reason, requests automatically fall back to:
 | `trinity-large-preview-free` | |
 | `x-preview-f-free` | |
 
-### 7 g4f Fallback Models (automatic fallback)
-| Model ID | Notes |
-|----------|-------|
-| `g4f/gemini-flash-lite` | Fastest fallback |
-| `g4f/gemini-2.0-flash` | |
-| `g4f/gemini-2.5-flash` | |
-| `g4f/gemini-2.5-pro` | Best quality fallback |
-| `g4f/gemini-2.0-flash-thinking` | Reasoning |
-| `g4f/command-r-plus` | Cohere |
-| `g4f/qwen-2.5-coder-32b` | Code focused |
-
 ---
 
 ## Requirements
@@ -121,14 +109,12 @@ Before installing, make sure you have:
 
 - **Linux** (Ubuntu, Mint, Debian, Arch — any systemd distro)
 - **Node.js v18 or newer** — [install with nvm](https://github.com/nvm-sh/nvm)
-- **Python 3** with pip (for g4f)
 - **OpenCode** installed — [opencode.ai](https://opencode.ai)
 - A free OpenCode account (sign up at opencode.ai — no credit card needed)
 
 Check your versions:
 ```bash
 node --version       # need v18+
-python3 --version    # need 3.8+
 opencode --version   # need any recent version
 ```
 
@@ -181,19 +167,12 @@ cp public/index.html public/style.css public/app.js \
 cp services/zen-rotator.service      ~/.config/systemd/user/
 cp services/opencode-serve.service   ~/.config/systemd/user/
 cp services/zen-bridge.service       ~/.config/systemd/user/
-cp services/g4f-api.service          ~/.config/systemd/user/
 cp services/opencode-dashboard.service ~/.config/systemd/user/
 
 systemctl --user daemon-reload
 ```
 
-### Step 5 — Install g4f (free model mirror pool)
-
-```bash
-pip install -U g4f
-```
-
-### Step 6 — Log in to OpenCode
+### Step 5 — Log in to OpenCode
 
 You need to be logged in to OpenCode so the bridge can use your free tier:
 
@@ -209,7 +188,6 @@ Follow the prompts to log in with your OpenCode account.
 systemctl --user enable --now zen-rotator.service
 systemctl --user enable --now opencode-serve.service
 systemctl --user enable --now zen-bridge.service
-systemctl --user enable --now g4f-api.service
 systemctl --user enable --now opencode-dashboard.service
 ```
 
@@ -278,7 +256,7 @@ You should get back a response like:
 
 ### Check all services are running
 ```bash
-systemctl --user status zen-bridge opencode-serve zen-rotator g4f-api
+systemctl --user status zen-bridge opencode-serve zen-rotator opencode-dashboard
 ```
 
 All should show `active (running)`.
@@ -288,7 +266,7 @@ All should show `active (running)`.
 xdg-open http://127.0.0.1:1395
 ```
 
-You'll see a real-time log of every completion, which model was used, how fast it responded, and which path it took (zen-live, zen-responses, or g4f-fallback).
+You'll see a realtime control center: usage cards (requests, tokens in/out, context chars), a 30-minute activity chart, the live completion stream with per-request token/context details, service controls with logs, a chain tester, the model list, per-model usage stats, recent OpenCode sessions, and the rotator proof log.
 
 ---
 
@@ -347,8 +325,7 @@ print(response.choices[0].message.content)
 | **zen-bridge** | 1343 | Main API — accepts OpenAI chat/completions and Responses API requests |
 | **opencode-serve** | 18765 | Real OpenCode client session — satisfies the "real client" auth check |
 | **zen-rotator** | 1341 | Injects a random `X-Real-IP` on every request to reset the rate limit |
-| **g4f-api** | 1337 | Local free model mirror pool — used as fallback when zen is slow |
-| **dashboard** | 1395 | Live web UI showing completions, models, status |
+| **dashboard** | 1395 | Realtime web UI: usage/tokens, chart, services, logs, sessions, proof |
 
 All services auto-restart if they crash (`Restart=always` in systemd units).
 
@@ -363,7 +340,7 @@ systemctl --user start zen-bridge opencode-serve zen-rotator
 ```
 
 ### "stream failed" errors in dashboard
-Normal — happens occasionally when a zen token bucket is temporarily exhausted. The bridge automatically retries with a different model or falls back to g4f. You don't need to do anything.
+Normal — happens occasionally when a zen token bucket is temporarily exhausted. The bridge automatically retries with a smaller body and falls back to big-pickle. You don't need to do anything.
 
 ### Dashboard shows "Waiting for stream…"
 The activity log directory might be missing. Fix:
@@ -408,14 +385,13 @@ opencode-zen-loophole/
 │
 ├── public/
 │   ├── index.html          ← Dashboard UI
-│   ├── style.css           ← Dark theme
-│   └── app.js              ← Live stream + model list
+│   ├── style.css           ← Retro theme
+│   └── app.js              ← Realtime stream, usage cards, chart, controls
 │
 ├── services/
 │   ├── zen-bridge.service
 │   ├── zen-rotator.service
 │   ├── opencode-serve.service
-│   ├── g4f-api.service
 │   └── opencode-dashboard.service
 │
 ├── docs/                   ← Technical deep-dives
