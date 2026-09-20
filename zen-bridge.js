@@ -213,10 +213,8 @@ function responsesBodyToChatBody(body) {
   let messages = [];
 
   if (typeof input === "string") {
-    // Plain string input → single user message
     messages = [{ role: "user", content: input }];
   } else if (Array.isArray(input)) {
-    // Array of message items (Responses API format)
     messages = input.map((item) => {
       if (item && item.type === "message") {
         const role = item.role || "user";
@@ -224,7 +222,6 @@ function responsesBodyToChatBody(body) {
         if (typeof item.content === "string") {
           content = item.content;
         } else if (Array.isArray(item.content)) {
-          // content parts: [{type:"input_text",text:"..."}] etc.
           content = item.content
             .map((c) => {
               if (typeof c === "string") return c;
@@ -234,15 +231,12 @@ function responsesBodyToChatBody(body) {
         }
         return { role, content };
       }
-      // Fallback: treat as user text
       return { role: "user", content: typeof item === "string" ? item : JSON.stringify(item) };
     });
   } else {
-    // Unexpected — pass empty user message so we don't crash
     messages = [{ role: "user", content: "" }];
   }
 
-  // Carry over system prompt if provided via instructions field
   if (body.instructions && typeof body.instructions === "string") {
     messages = [{ role: "system", content: body.instructions }, ...messages];
   }
@@ -253,6 +247,250 @@ function responsesBodyToChatBody(body) {
     stream: !!body.stream,
     temperature: body.temperature,
     max_tokens: body.max_output_tokens || body.max_tokens,
+  };
+}
+
+/**
+ * Emit proper OpenAI Responses API SSE events.
+ *
+ * The Vercel AI SDK @ai-sdk/openai provider uses /v1/responses and expects
+ * this exact SSE event schema — NOT chat.completion.chunk objects.
+ *
+ * Event sequence:
+ *   response.created
+ *   response.output_item.added        (the assistant message item)
+ *   response.content_part.added       (the text part)
+ *   response.output_text.delta        (repeated for each text chunk)
+ *   response.output_text.done
+ *   response.content_part.done
+ *   response.output_item.done
+ *   response.completed
+ */
+function zenStreamResponsesToClient(res, model, chatBody) {
+  return new Promise(async (resolve, reject) => {
+    const t0 = Date.now();
+    let sessionID = null;
+    let assistantMsgId = null;
+    let fullText = "";
+    let tokens = null;
+    let settled = false;
+    let sub = null;
+    const respId = "resp_" + crypto.randomBytes(12).toString("hex");
+    const itemId = "item_" + crypto.randomBytes(8).toString("hex");
+    const created = Math.floor(Date.now() / 1000);
+
+    const safeWrite = (obj) => {
+      try { res.write("event: " + obj.type + "\ndata: " + JSON.stringify(obj) + "\n\n"); } catch {}
+    };
+
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      if (sub) sub.close();
+      if (sessionID) callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {});
+      if (err) {
+        if (res.headersSent) {
+          // Close the stream cleanly; SDK will surface a partial result
+          try {
+            safeWrite({
+              type: "response.completed",
+              response: buildResponseObj(respId, model, created, fullText, tokens, "incomplete"),
+            });
+            res.write("data: [DONE]\n\n");
+            res.end();
+          } catch {}
+          resolve({ sessionID, text: fullText, tokens, ms: Date.now() - t0, path: "zen-responses-partial", streamErr: err.message });
+        } else {
+          reject(err);
+        }
+      } else {
+        resolve({ sessionID, text: fullText, tokens, ms: Date.now() - t0, path: "zen-responses" });
+      }
+    };
+
+    function buildResponseObj(id, mdl, ts, text, tok, status) {
+      return {
+        id,
+        object: "response",
+        created_at: ts,
+        model: mdl,
+        status: status || "completed",
+        output: [{
+          type: "message",
+          id: itemId,
+          role: "assistant",
+          content: [{ type: "output_text", text, annotations: [] }],
+          status: "completed",
+        }],
+        usage: tok ? {
+          input_tokens: tok.input || tok.prompt || 0,
+          output_tokens: tok.output || tok.completion || 0,
+          total_tokens: tok.total || 0,
+        } : { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+      };
+    }
+
+    try {
+      const session = await callServe("POST", "/session", { directory: null }, 15000);
+      if (session.status !== 200 || !session.json || !session.json.id) {
+        throw new Error("serve session failed: " + session.status);
+      }
+      sessionID = session.json.id;
+
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        ...proofHeaders({
+          "x-loophole-path": "zen-responses",
+          "x-loophole-session": sessionID,
+          "x-loophole-model": model,
+        }),
+      });
+
+      // 1. response.created
+      safeWrite({ type: "response.created", response: buildResponseObj(respId, model, created, "", null, "in_progress") });
+
+      // 2. output_item.added
+      safeWrite({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "message", id: itemId, role: "assistant", content: [], status: "in_progress" },
+      });
+
+      // 3. content_part.added
+      safeWrite({
+        type: "response.content_part.added",
+        item_id: itemId,
+        output_index: 0,
+        content_index: 0,
+        part: { type: "output_text", text: "", annotations: [] },
+      });
+
+      const timer = setTimeout(() => finish(new Error("zen responses stream timeout")), ZEN_TIMEOUT_MS);
+
+      let lastDeltaAt = Date.now();
+      const stallCheck = setInterval(() => {
+        if (settled) { clearInterval(stallCheck); return; }
+        if (fullText.length > 0 && Date.now() - lastDeltaAt > 15000) {
+          clearInterval(stallCheck);
+          clearTimeout(timer);
+          flushAndFinish();
+        }
+      }, 2000);
+
+      function flushAndFinish() {
+        if (settled) return;
+        try {
+          safeWrite({ type: "response.output_text.done", item_id: itemId, output_index: 0, content_index: 0, text: fullText });
+          safeWrite({ type: "response.content_part.done", item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: fullText, annotations: [] } });
+          safeWrite({ type: "response.output_item.done", output_index: 0, item: { type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text: fullText, annotations: [] }], status: "completed" } });
+          safeWrite({ type: "response.completed", response: buildResponseObj(respId, model, created, fullText, tokens, "completed") });
+          res.write("data: [DONE]\n\n");
+          res.end();
+        } catch {}
+        writeProof({ path: "zen-responses", sessionID, model, ms: Date.now() - t0, chars: fullText.length, tokens, rotator: readRotatorTail(3), sample: fullText.slice(0, 160) });
+        finish(null);
+      }
+
+      sub = subscribeEvents((evt) => {
+        if (settled) return;
+        const type = evt.type;
+        const props = evt.properties || {};
+        if (props.sessionID && props.sessionID !== sessionID) return;
+
+        if (type === "message.updated") {
+          const info = props.info || {};
+          if (info.role === "assistant" && info.id) {
+            assistantMsgId = info.id;
+            if (info.tokens) tokens = info.tokens;
+          }
+        }
+
+        if (type === "message.part.delta") {
+          if (assistantMsgId && props.messageID && props.messageID !== assistantMsgId) return;
+          if (props.field && props.field !== "text") return;
+          const delta = props.delta || "";
+          if (!delta) return;
+          if (!assistantMsgId && props.messageID) assistantMsgId = props.messageID;
+          fullText += delta;
+          lastDeltaAt = Date.now();
+          // Emit proper Responses API delta event
+          safeWrite({
+            type: "response.output_text.delta",
+            item_id: itemId,
+            output_index: 0,
+            content_index: 0,
+            delta,
+          });
+        }
+
+        const isIdle =
+          type === "session.idle" ||
+          (type === "session.status" && props.status && props.status.type === "idle") ||
+          (type === "session.updated" && props.session && props.session.time && props.session.time.completed);
+
+        if (isIdle) {
+          clearTimeout(timer);
+          clearInterval(stallCheck);
+          flushAndFinish();
+        }
+      });
+
+      await new Promise((r) => setTimeout(r, 80));
+      const prompt = await callServe(
+        "POST",
+        `/session/${sessionID}/prompt_async`,
+        {
+          model: { providerID: "opencode", modelID: model },
+          parts: buildParts(chatBody),
+        },
+        15000
+      );
+      if (prompt.status !== 204 && prompt.status !== 200) {
+        clearTimeout(timer);
+        clearInterval(stallCheck);
+        throw new Error("prompt_async failed: " + prompt.status + " " + (prompt.raw || "").slice(0, 200));
+      }
+    } catch (e) {
+      finish(e);
+    }
+  });
+}
+
+/**
+ * Non-streaming Responses API: collect full text then return a proper Response object.
+ */
+async function zenResponsesOnce(model, chatBody) {
+  const { openaiRes, sessionID, path: p } = await zenOnce(model, chatBody);
+  const text = (((openaiRes.choices || [])[0] || {}).message || {}).content || "";
+  const created = Math.floor(Date.now() / 1000);
+  const itemId = "item_" + crypto.randomBytes(8).toString("hex");
+  const respId = "resp_" + (openaiRes.id || crypto.randomBytes(12).toString("hex")).replace(/^chatcmpl-/, "");
+  const tok = openaiRes.usage;
+  return {
+    responsesObj: {
+      id: respId,
+      object: "response",
+      created_at: created,
+      model,
+      status: "completed",
+      output: [{
+        type: "message",
+        id: itemId,
+        role: "assistant",
+        content: [{ type: "output_text", text, annotations: [] }],
+        status: "completed",
+      }],
+      usage: tok ? {
+        input_tokens: tok.prompt_tokens || 0,
+        output_tokens: tok.completion_tokens || 0,
+        total_tokens: tok.total_tokens || 0,
+      } : { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    },
+    sessionID,
+    path: p,
+    text,
   };
 }
 
@@ -859,54 +1097,99 @@ const server = http.createServer((req, res) => {
   }
 
   // ── /v1/responses — OpenAI Responses API ──────────────────────────────────
-  // Newer OpenAI SDK versions and clients (e.g. opencode itself may send this)
-  // use POST /v1/responses instead of /v1/chat/completions.
-  // We convert the input format and delegate to the same handleChat pipeline.
+  // The Vercel AI SDK @ai-sdk/openai provider (used by opencode internally)
+  // calls POST /v1/responses instead of /v1/chat/completions.
+  // We return proper Responses API SSE events (response.output_text.delta etc.)
+  // so the SDK does NOT throw "Received a Chat Completions stream while using
+  // the OpenAI Responses API".
   if (urlPath === "/v1/responses" && req.method === "POST") {
     let chunks = "";
     const started = Date.now();
-    req.on("data", (c) => {
-      chunks += c;
-    });
+    req.on("data", (c) => { chunks += c; });
     req.on("end", () => {
       let rawBody = {};
-      try {
-        rawBody = JSON.parse(chunks || "{}");
-      } catch {}
+      try { rawBody = JSON.parse(chunks || "{}"); } catch {}
 
-      // Convert Responses API body → chat completions body
-      const body = responsesBodyToChatBody(rawBody);
-      const model = body.model || "big-pickle";
-      const streamReq = !!body.stream;
+      // Convert Responses API body → chat completions body for internal use
+      const chatBody = responsesBodyToChatBody(rawBody);
+      const model = chatBody.model || "big-pickle";
+      const streamReq = !!rawBody.stream;
       const t0 = Date.now();
 
-      handleChat(res, body, streamReq)
-        .then((meta) => {
-          logActivity({
-            event: "completion",
-            api: "responses",
-            model,
-            resolved: meta && meta.model,
-            path: meta && meta.path,
-            stream: streamReq,
-            status: 200,
-            ms: Date.now() - t0,
-            reqMs: t0 - started,
-            real: true,
+      const resolved = resolveZenModel(model);
+      const zenModel = FAST_ZEN.has(resolved.requested) ? resolved.requested : resolved.zenModel;
+
+      const doRequest = async () => {
+        // Try zen path first
+        const tryZenResponses = async (mdl) => {
+          if (streamReq) {
+            return await zenStreamResponsesToClient(res, mdl, chatBody);
+          }
+          const result = await zenResponsesOnce(mdl, chatBody);
+          res.writeHead(200, {
+            "Content-Type": "application/json",
+            ...proofHeaders({ "x-loophole-path": result.path, "x-loophole-model": mdl }),
           });
+          res.end(JSON.stringify(result.responsesObj));
+          return result;
+        };
+
+        try {
+          return await tryZenResponses(resolved.requested);
+        } catch (e1) {
+          if (streamReq && res.headersSent) {
+            return { path: "zen-responses-partial", model: zenModel, streamErr: e1.message };
+          }
+          // Remap fallback
+          if (zenModel !== resolved.requested) {
+            try {
+              return await tryZenResponses(zenModel);
+            } catch (e2) {
+              console.error("Zen Bridge /v1/responses remap failed:", e2.message);
+            }
+          }
+          // g4f fallback — wrap chat completion as Responses API response
+          const g4fResult = await g4fOnce(chatBody);
+          const text = ((((g4fResult.openaiRes.choices || [])[0] || {}).message || {}).content) || "";
+          const respId = "resp_g4f_" + Date.now().toString(16);
+          const itemId = "item_g4f_" + Date.now().toString(16);
+          const created = Math.floor(Date.now() / 1000);
+          const responsesObj = {
+            id: respId, object: "response", created_at: created, model, status: "completed",
+            output: [{ type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text, annotations: [] }], status: "completed" }],
+            usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+          };
+
+          if (streamReq && !res.headersSent) {
+            res.writeHead(200, {
+              "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive",
+              ...proofHeaders({ "x-loophole-path": "g4f-responses-fallback" }),
+            });
+            const safeWrite = (obj) => { try { res.write("event: " + obj.type + "\ndata: " + JSON.stringify(obj) + "\n\n"); } catch {} };
+            safeWrite({ type: "response.created", response: { ...responsesObj, status: "in_progress", output: [] } });
+            safeWrite({ type: "response.output_item.added", output_index: 0, item: { type: "message", id: itemId, role: "assistant", content: [], status: "in_progress" } });
+            safeWrite({ type: "response.content_part.added", item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
+            safeWrite({ type: "response.output_text.delta", item_id: itemId, output_index: 0, content_index: 0, delta: text });
+            safeWrite({ type: "response.output_text.done", item_id: itemId, output_index: 0, content_index: 0, text });
+            safeWrite({ type: "response.content_part.done", item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text, annotations: [] } });
+            safeWrite({ type: "response.output_item.done", output_index: 0, item: { type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text, annotations: [] }], status: "completed" } });
+            safeWrite({ type: "response.completed", response: responsesObj });
+            res.write("data: [DONE]\n\n");
+            res.end();
+          } else if (!res.headersSent) {
+            res.writeHead(200, { "Content-Type": "application/json", ...proofHeaders({ "x-loophole-path": "g4f-responses-fallback" }) });
+            res.end(JSON.stringify(responsesObj));
+          }
+          return { path: "g4f-responses-fallback", model };
+        }
+      };
+
+      doRequest()
+        .then((meta) => {
+          logActivity({ event: "completion", api: "responses", model, resolved: meta && meta.model, path: meta && meta.path, stream: streamReq, status: 200, ms: Date.now() - t0, reqMs: t0 - started, real: true });
         })
         .catch((e) => {
-          logActivity({
-            event: "completion",
-            api: "responses",
-            model,
-            stream: streamReq,
-            status: e.status || 500,
-            ms: Date.now() - t0,
-            reqMs: t0 - started,
-            error: e.message,
-            real: true,
-          });
+          logActivity({ event: "completion", api: "responses", model, stream: streamReq, status: e.status || 500, ms: Date.now() - t0, reqMs: t0 - started, error: e.message, real: true });
           if (!res.headersSent) {
             res.writeHead(e.status || 500, { "Content-Type": "application/json", ...proofHeaders() });
             res.end(JSON.stringify({ error: { message: "bridge: " + e.message } }));

@@ -46,7 +46,7 @@
       "options": {
         "baseURL": "http://127.0.0.1:1343/v1"
       }
-    },
+    }
 
   },
   "persist_workspace": true,
