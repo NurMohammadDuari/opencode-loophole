@@ -32,12 +32,32 @@ h1, h2 {
   margin-top: 5px;
   font-size: 12px;
 }
-button {
+.mono {
+  font-family: "Courier New", Courier, monospace;
+}
+.dim {
+  color: #555;
+}
+.controls {
+  margin-bottom: 6px;
+}
+button, .btn {
   background: #c0c0c0;
   border: 2px outset #fff;
   font-weight: bold;
   padding: 5px 10px;
+  cursor: pointer;
 }
-button:active {
+button:active, .btn:active {
   border-style: inset;
+}
+/* Stop button – red tint so it's visually distinct */
+.btn.off {
+  background: #cc3333;
+  color: #fff;
+  border-color: #ff6666;
+}
+.btn.off:active {
+  border-style: inset;
+  background: #aa2222;
 }
