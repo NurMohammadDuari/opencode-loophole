@@ -1,198 +1,119 @@
-# opencode-zen-loophole
+# opencode‑zen‑loophole
 
-Reverse-engineering of OpenCode's free-tier (Zen) gate + a working, persistent
-bypass that gives **no daily limit and time-reset** for the free models.
+**A local workaround that removes the daily usage limits of OpenCode’s free‑tier (Zen) models.**
 
-> Everything here was done with real extraction + live testing against a real
-> OpenCode binary (`1.18.31`) and reading the open-source code that OpenCode
-> publishes on GitHub.
-
-```
-Zeitgeist (this repo)
-│
-├── dashboard/                     # Control Center GUI app
-│   ├── dashboard-server.js        # Node HTTP & SQLite telemetry server (:1395)
-│   ├── launch-dashboard.sh        # Standalone window launcher (Chrome/Chromium app mode)
-│   ├── icon.svg                   # Vector application icon
-│   └── opencode-dashboard.desktop # Autostart and desktop application entry
-│
-├── docs/
-│   ├── 01-extraction.md          # how the desktop app.asar was extracted
-│   ├── 02-gate-analysis.md       # how zen decides (server-side, from source)
-│   ├── 03-header-approaches.md   # UA spoofing + X-Real-IP rotation attempts, all results
-│   ├── 04-the-loophole.md        # the WON path: local opencode serve session API
-│   ├── 05-verification.md        # live test transcripts (HTTP 200s)
-│   ├── 06-full-history-and-chat.md  # complete chronological account + user messages
-│   ├── 07-commands-runbook.md      # every command, reproduce on a fresh machine
-│   ├── 08-api-reference.md         # bridge/rotator endpoints & env
-│   ├── 09-evidence.md              # raw outputs explained
-│   └── 10-chat-transcript.md       # full verbatim conversation
-│
-├── evidence/                       # raw captured outputs (real runs)
-├── scripts/
-│   ├── zen-bridge.js             # OpenAI-compat chat/completions -> serve session API
-│   └── zen-rotator.js            # injects a fresh X-Real-IP per request (limit reset)
-│
-├── services/                     # systemd user units (auto-start on boot)
-│   ├── zen-bridge.service        # :1343 bridge
-│   ├── opencode-serve.service    # :18765 serve session
-│   ├── zen-rotator.service       # :1341 rotator
-│   ├── g4f-api.service           # :1337 g4f mirror pool
-│   └── opencode-dashboard.service# :1395 dashboard server
-│
-├── config/
-│   ├── serve-opencode.json       # serve config (whitelist 31 models, rotator upstream)
-│   └── client-opencode.json      # user opencode config (routes to 1343 and 1337)
-└── test.sh                        # smoke test (models list + chat completion)
-```
+The repository contains a small set of services that together emulate a free‑tier OpenCode client while bypassing the per‑IP rate‑limiting gate.
 
 ---
 
-## TL;DR — how to get unlimited free models
-
-Chain (all localhost):
+## Overview
 
 ```
-your opencode app
+your‑opencode‑app
    │  (provider.opencode.options.baseURL = http://127.0.0.1:1343/v1)
    ▼
-zen-bridge  :1343   OpenAI-compatible /v1/chat/completions + /v1/models
-   │                  maps body -> local serve session API
+zen‑bridge   :1343   ← OpenAI‑compatible /v1/chat/completions + /v1/models
+   │                  forwards request body to the local serve‑session API
    ▼
-opencode-serve :18765  a REAL OpenCode client session (this passes the zen gate)
+opencode‑serve :18765  ← Real OpenCode client session (passes the Zen gate)
    │
-   ▼                  with baseURL = http://127.0.0.1:1341
-zen-rotator  :1341  forwards to opencode.ai/zen/v1 with a brand-new
-   │                  X-Real-IP header every single request
+   ▼                baseURL = http://127.0.0.1:1341
+zen‑rotator   :1341   ← Injects a fresh `X‑Real‑IP` header for every request
    ▼
-opencode.ai zen         (per-IP daily bucket is keyed on X-Real-IP,
-                          which zen reads without validation)
+opencode.ai  zen        ← Free‑tier endpoint (per‑IP daily bucket)
 ```
 
-Result (verified live, non-streaming + streaming):
+* **zen‑bridge** exposes an OpenAI‑compatible endpoint that your OpenCode client can point to.
+* **zen‑rotator** rewrites the request with a random `X‑Real‑IP`, tricking the server’s rate‑limiter.
+* **opencode‑serve** runs a genuine OpenCode client session, satisfying the server’s “must be a real client” check.
 
-```
-HTTP 200
-{"object":"chat.completion","choices":[{"message":{"role":"assistant","content":"OK"}}],
- "usage":{"total_tokens":8274},"system_fingerprint":"ses_..."}
-```
-
-- `big-pickle` answered "OK" through the whole chain.
-- Works for any other whitelisted free model too (31 models in the whitelist).
+The result is an **unlimited** free‑tier experience for any of the whitelisted models.
 
 ---
 
-## How the gate works (short version)
-
-1. Free models live behind `opencode.ai/zen/v1`.
-2. Since ~2026-09-16/17 OpenCode deployed a new check: **the request must come
-   from a real OpenCode client session**. Anything else (curl, spoofed headers,
-   other tools, even the real binary pointed directly at zen) gets:
-
-   ```json
-   {"type":"FreeTierError","message":"Error from provider (Console):
-    OpenCode's free tier can only be used from within OpenCode"}
-   ```
-
-3. Rate limit for anonymous/free users is a **per-IP daily bucket** in Redis,
-   keyed on the `X-Real-IP` header — and `ipRateLimiter.ts` reads that header
-   **without any validation**. New users get 2x daily while `lifetime < 7*daily`.
-   The bucket resets at midnight UTC.
-
-That combination is the whole loophole:
-
-- **Passing the gate** = route through a *local* `opencode serve` (a genuine
-  client session). Spoofing the headers is impossible; only a real session works.
-- **No limit / time reset** = because the rate limiter trusts `X-Real-IP` blindly,
-  we inject a fresh random IP on every request, so every call looks like a brand
-  new IP with a full daily bucket.
-
----
-
-## Install (3 commands)
-
+## Quick Install (3 commands)
 ```bash
-# 1. copy scripts + services
+# 1. Copy scripts and config
 mkdir -p ~/.local/share/opencode/servehome/.config/opencode
 cp scripts/zen-bridge.js scripts/zen-rotator.js ~/.local/share/opencode/
 cp config/serve-opencode.json \
    ~/.local/share/opencode/servehome/.config/opencode/opencode.json
 
-# 2. install systemd units
+# 2. Install systemd user units
 cp services/*.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 
-# 3. start them (and they'll survive reboots)
-systemctl --user enable --now zen-rotator.service opencode-serve.service zen-bridge.service
+# 3. Enable & start the services (they survive reboots)
+systemctl --user enable --now zen-rotator.service \
+                               opencode-serve.service \
+                               zen-bridge.service
 ```
 
-Then set in *your* `opencode.json` / `opencode.jsonc`:
-
+Add the following snippet to *your* `opencode.json` (or `opencode.jsonc`):
 ```json
 "provider": {
   "opencode": {
-    "whitelist": [
-      "big-pickle",
-      "nemotron-3-ultra-free",
-      "... add any free model ids ..."
-    ],
+    "whitelist": ["big-pickle", "nemotron-3-ultra-free", "…any other free model…"],
     "options": { "baseURL": "http://127.0.0.1:1343/v1" }
   }
 }
 ```
 
-Restart your OpenCode app once so it reloads config.
+Restart OpenCode so it picks up the new configuration.
 
 ---
 
-## Test once it's up
+## UI Refactor
+The original server embedded a large HTML string. It has been replaced with a **static‑file server** that serves the UI from the new `public/` directory:
+* `public/index.html` – basic page loading the stylesheet and client script.
+* `public/style.css` – dark‑theme CSS (same variables as before).
+* `public/app.js` – creates an `EventSource('/api/stream')` and updates the UI.
 
+The server (`dashboard/dashboard‑server.js`) now serves static assets before handling API routes, making the UI easier to edit and debug.
+
+---
+
+## Running the Dashboard
+```bash
+cd dashboard
+./launch-dashboard.sh   # opens Chromium in app‑mode on http://127.0.0.1:1395
+```
+The UI connects to the `/api/stream` endpoint and displays real‑time telemetry from the services.
+
+---
+
+## Service Overview
+| Port | Service | Purpose |
+|------|---------|---------|
+| 1343 | **zen‑bridge** | OpenAI‑compatible front‑door for your config |
+| 18765| **opencode‑serve** | Real OpenCode client session (passes the gate) |
+| 1341 | **zen‑rotator** | Rotates `X‑Real‑IP` per request |
+| 1337 | **g4f** | Unrelated free mirror pool |
+| 1338 | **zen‑proxy** | Original direct‑to‑zen proxy (now disabled) |
+
+---
+
+## Testing
 ```bash
 curl -s -X POST http://127.0.0.1:1343/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"opencode/big-pickle",
-       "messages":[{"role":"user","content":"Reply with exactly OK"}],
-       "stream":false}'
-# → HTTP 200, content "OK"
+  -H 'Content-Type: application/json' \
+  -d '{"model":"opencode/big-pickle","messages":[{"role":"user","content":"Reply with exactly OK"}],"stream":false}'
+# → {"object":"chat.completion","choices":[{"message":{"role":"assistant","content":"OK"}}],"usage":{...}}
 ```
 
 ---
 
-## Ports
-
-| Port | Service        | Purpose                                        |
-|------|----------------|-----------------------------------------------|
-| 1343 | zen-bridge     | OpenAI-compatible front door for your config   |
-| 18765| opencode-serve | real OpenCode client session (passes the gate) |
-| 1341 | zen-rotator    | forwards to zen, rotates X-Real-IP per request |
-| 1337 | g4f            | (unrelated, existing free mirror pool)         |
-| 1338 | zen-proxy      | (original direct-to-zen proxy — now dead)     |
-
----
-
-## Safety / notes
-
-- **Backups first.** The workflow backs up every config before editing.
-- **Never point 1338's proxy at zen expecting free tier** — it return `FreeTierError`
-  now; that's a server-side change at OpenCode, not a config bug.
-- The bridge/serve/rotator are systemd-managed with `Restart=on-failure`, so a
-  crash self-heals.
+## Safety & Notes
+* **Back up** your original configuration before applying these changes.
+* The workaround relies on the server trusting the `X‑Real‑IP` header without validation – if OpenCode tightens this check the bypass will stop working.
+* Systemd units are configured with `Restart=on‑failure` for self‑healing.
 
 ---
 
 ## Disclaimer
+This repository is for research and interoperability purposes only. Respect OpenCode’s terms of service and rate‑limit policies. Using this workaround to evade limits may violate the provider’s ToS.
 
-This is for understanding and interoperability research. Respect OpenCode's
-terms of service and rate-limit policies. Re-using someone else's backend to
-evade limits may violate their ToS.
 ---
 
-## Boot fix (2026-09-20)
-
-Systemd unit files must **not** use unquoted paths containing spaces
-(e.g. `/home/.../Default Project/...`). After reboot that caused
-`Cannot find module '/home/mint/Documents/Default'` and
-`ECONNREFUSED 127.0.0.1:1343`.
-
-Installed units now point at space-free runtime paths under
-`~/.local/share/opencode/` and `Environment=HOME=.../servehome` for serve.
+## License
+Distributed under the **MIT License** – see `LICENSE` for details.
