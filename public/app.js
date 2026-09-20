@@ -3,6 +3,35 @@
 let streamRunning = false;
 let es = null;
 
+function formatEntry(en) {
+  const time   = new Date(en.ts).toLocaleTimeString();
+  const model  = en.resolved || en.model || '?';
+  const type   = en.stream ? '[SSE]' : '[JSON]';
+  const status = en.status != null ? en.status : '?';
+  const ms     = en.ms   != null ? en.ms + 'ms' : '';
+  const err    = en.error ? ' ERR:' + en.error : '';
+  const pth    = 'path=' + (en.path != null ? en.path : '–');
+  return `${time} ${model} ${type} ${status} ${ms}${err} ${pth}`;
+}
+
+function renderLog(entries) {
+  const log = document.getElementById('streamlog');
+  // Build colored HTML so errors stand out
+  const html = entries.map((en) => {
+    const line = formatEntry(en);
+    const isErr = en.status !== 200 || en.error;
+    return isErr
+      ? `<span style="color:#cc3333">${escHtml(line)}</span>`
+      : escHtml(line);
+  }).join('\n');
+  log.innerHTML = html;
+  log.scrollTop = log.scrollHeight;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
 function toggleStream() {
   streamRunning = !streamRunning;
   const btn = document.getElementById('streamBtn');
@@ -10,42 +39,25 @@ function toggleStream() {
     btn.textContent = '■ Stop Stream';
     btn.className = 'btn off';
     es = new EventSource('/api/stream');
-    es.onopen = () => console.log('EventSource connection opened');
     es.onmessage = (e) => {
       try {
         const d = JSON.parse(e.data);
-        if (d.entries && d.entries.length) {
-          const log = document.getElementById('streamlog');
-          log.textContent = d.entries
-            .map((en) => {
-              const time = new Date(en.ts).toLocaleTimeString();
-              const model = en.resolved || en.model || '?';
-              const type = en.stream ? '[SSE]' : '[JSON]';
-              const status = en.status;
-              const ms = en.ms != null ? en.ms + 'ms' : '';
-              const err = en.error ? ' ERR:' + en.error : '';
-              const pathStr = 'path=' + (en.path || 'undefined');
-              return `${time} ${model} ${type} ${status} ${ms}${err} ${pathStr}`;
-            })
-            .join('\n');
-          log.scrollTop = log.scrollHeight;
-          const last = d.entries[d.entries.length - 1];
-          document.getElementById('pipeline-path').textContent = last.path || '–';
-          document.getElementById('pipeline-model').textContent =
-            last.resolved || last.model || '–';
-        }
+        if (!d.entries || !d.entries.length) return;
+        renderLog(d.entries);
+        const last = d.entries[d.entries.length - 1];
+        document.getElementById('pipeline-path').textContent  = last.path  != null ? last.path  : '–';
+        document.getElementById('pipeline-model').textContent = last.resolved || last.model || '–';
       } catch (err) {
-        console.error('Error parsing SSE data', err);
+        console.error('SSE parse error', err);
       }
     };
     es.onerror = () => {
-      console.error('EventSource error, closing');
+      console.error('EventSource error');
       if (es) { es.close(); es = null; }
       streamRunning = false;
       const b = document.getElementById('streamBtn');
       b.textContent = '▶ Start Stream';
       b.className = 'btn';
-      // No alert — just silently reset so the user can click Start again
     };
   } else {
     btn.textContent = '▶ Start Stream';
@@ -61,8 +73,5 @@ function updateClock() {
 setInterval(updateClock, 1000);
 updateClock();
 
-// Auto-start the SSE stream when the page loads; sync button to running state
-document.addEventListener('DOMContentLoaded', () => {
-  // Button starts as "▶ Start Stream" (off); toggleStream() flips it to running
-  toggleStream();
-});
+// Auto-start the SSE stream; toggleStream flips button to running state
+document.addEventListener('DOMContentLoaded', () => { toggleStream(); });

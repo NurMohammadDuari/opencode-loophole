@@ -27,6 +27,9 @@ h1, h2 {
   height: 200px;
   overflow: auto;
   font-size: 14px;
+  white-space: pre;
+  font-family: "Courier New", Courier, monospace;
+  padding: 4px;
 }
 .kv {
   margin-top: 5px;
