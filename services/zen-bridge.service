@@ -13,6 +13,10 @@ Environment=SERVE_PORT=18765
 Environment=SERVE_USER=opencode
 Environment=SERVE_PASS=opencodepass
 Environment=HOME=/home/mint
+Environment=FAST_RACE=1
+Environment=G4F_FAST_MODEL=gemini-flash-lite
+Environment=ZEN_TIMEOUT_MS=45000
+Environment=G4F_TIMEOUT_MS=25000
 
 [Install]
 WantedBy=default.target
