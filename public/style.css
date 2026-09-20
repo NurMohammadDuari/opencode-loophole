@@ -1,0 +1,21 @@
+/* Simple dark theme for the Loophole Dashboard */
+:root {
+  --bg: #090d16;
+  --panel: #111827;
+  --panel2: #0e1422;
+  --border: #1f293d;
+  --text: #f1f5f9;
+  --dim: #94a3b8;
+  --green: #10b981;
+  --blue: #3b82f6;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+* { box-sizing: border-box; margin:0; padding:0; }
+body { background: var(--bg); color: var(--text); font-family: var(--mono); padding: 20px; }
+.top-bar { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; }
+h1 { font-size:1.5rem; }
+.panel { background: var(--panel); border:1px solid var(--border); border-radius:8px; padding:16px; margin-bottom:20px; }
+.btn { cursor:pointer; background: var(--panel2); color: var(--text); border:1px solid var(--border); border-radius:4px; padding:6px 12px; }
+.btn:hover { background: var(--blue); border-color: var(--blue); }
+.log { background: var(--panel2); color: var(--text); padding:10px; border:1px solid var(--border); border-radius:4px; max-height:200px; overflow:auto; white-space:pre-wrap; font-family: var(--mono); }
+.kv { display:flex; justify-content:space-between; margin-top:8px; font-size:0.9rem; }

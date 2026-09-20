@@ -250,7 +250,28 @@ const server = http.createServer(async (req, res) => {
   const p = u.pathname;
 
   try {
-    if (p === "/" || p === "/index.html") return sendText(res, 200, UI, "text/html; charset=utf-8");
+    // Serve static UI files from public directory
+    if (p === "/" || p === "/index.html") {
+      const html = fs.readFileSync(path.join(__dirname, "public", "index.html"), "utf8");
+      return sendText(res, 200, html, "text/html; charset=utf-8");
+    }
+    // Serve other static assets (CSS, JS, images)
+    const staticPath = path.join(__dirname, "public", p);
+    if (fs.existsSync(staticPath) && fs.statSync(staticPath).isFile()) {
+      const ext = path.extname(staticPath).toLowerCase();
+      const mimeMap = {
+        ".html": "text/html; charset=utf-8",
+        ".css": "text/css",
+        ".js": "application/javascript",
+        ".svg": "image/svg+xml",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".gif": "image/gif"
+      };
+      const mime = mimeMap[ext] || "application/octet-stream";
+      const data = fs.readFileSync(staticPath);
+      return sendText(res, 200, data, mime);
+    }
     if (p === "/api/status" && req.method === "GET") return sendJson(res, 200, await status());
     if (p === "/api/system" && req.method === "GET") return sendJson(res, 200, systemInfo());
     if (p === "/api/activity" && req.method === "GET") return sendJson(res, 200, { ok: true, entries: readActivity(300), agg: aggregateActivity() });
@@ -333,8 +354,8 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log("OpenCode Loophole Dashboard listening on http://127.0.0.1:" + PORT);
 });
 
-const UI = `<!doctype html>
-<html lang="en">
+
+
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -631,6 +652,7 @@ function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<'
 let streamRunning = false;
 let es = null;
 async function toggleStream(){
+<<<<<<< HEAD
   streamRunning=!streamRunning;
   const btn=el('streamBtn');
   if(streamRunning){
@@ -661,6 +683,47 @@ async function toggleStream(){
   } else {
     btn.textContent='▶ Start Stream'; btn.className='btn';
     if(es){ es.close(); es = null; }
+=======
+  console.log('toggleStream called, current state:', streamRunning);
+  streamRunning = !streamRunning;
+  const btn = el('streamBtn');
+  if (streamRunning) {
+    btn.textContent = '■ Stop Stream';
+    btn.className = 'btn off';
+    // Use EventSource for Server‑Sent Events
+    es = new EventSource('/api/stream');
+    es.onopen = () => console.log('EventSource connection opened');
+    es.onmessage = e => {
+      console.log('SSE raw data:', e.data);
+      try {
+        const d = JSON.parse(e.data);
+        if (d.entries && d.entries.length) {
+          el('streamlog').textContent = d.entries.map(en =>
+            new Date(en.ts).toLocaleTimeString() + ' ' + en.model + ' ' + (en.stream ? '[SSE]' : '[JSON]') + ' ' + en.status + 'ms' + (en.error ? ' ERR:' + en.error : '') + ' path=' + en.path
+          ).join('\n');
+          el('streamlog').scrollTop = el('streamlog').scrollHeight;
+          const last = d.entries[d.entries.length - 1];
+          el('pipeline-path').textContent = last.path || '–';
+          el('pipeline-model').textContent = last.model || '–';
+        }
+      } catch (err) {
+        console.error('Error parsing SSE data', err);
+      }
+    };
+    es.onerror = () => {
+      console.error('EventSource error, closing');
+      if (es) { es.close(); es = null; }
+      streamRunning = false;
+      btn.textContent = '▶ Start Stream';
+      btn.className = 'btn';
+      toast('Stream stopped due to error');
+    };
+  } else {
+    console.log('Stopping stream');
+    btn.textContent = '▶ Start Stream';
+    btn.className = 'btn';
+    if (es) { es.close(); es = null; }
+>>>>>>> c7ee6d3 (chore: serve UI from static public folder, remove inline UI constant)
   }
 }
 

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenCode Loophole Dashboard</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="top-bar">
+    <h1>OpenCode Loophole Control Center</h1>
+    <div id="clock" class="mini mono"></div>
+  </div>
+
+  <section class="panel">
+    <h2>Live Stream (real‑time bridge completions)</h2>
+    <div class="controls">
+      <button class="btn" id="streamBtn" onclick="toggleStream()">▶ Start Stream</button>
+    </div>
+    <pre id="streamlog" class="log">Waiting for stream…</pre>
+    <div class="kv">
+      <span class="dim">Last Completion Path</span>
+      <b id="pipeline-path" class="mono">–</b>
+    </div>
+    <div class="kv">
+      <span class="dim">Last Model / Sample</span>
+      <b id="pipeline-model" class="mono">–</b>
+    </div>
+  </section>
+
+  <script src="app.js"></script>
+</body>
+</html>
