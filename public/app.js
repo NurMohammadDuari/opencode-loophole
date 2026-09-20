@@ -3,6 +3,7 @@
 let streamRunning = false;
 let es = null;
 let allModels = [];
+let reconnectTimer = null;
 
 /* ── helpers ── */
 function escHtml(s) {
@@ -26,6 +27,7 @@ function formatEntry(en) {
 
 function renderLog(entries) {
   const log = document.getElementById('streamlog');
+  if (!entries || !entries.length) return;
   const html = entries.map((en) => {
     const line  = formatEntry(en);
     const isErr = en.status !== 200 || !!en.error;
@@ -37,37 +39,57 @@ function renderLog(entries) {
   log.scrollTop = log.scrollHeight;
 }
 
-/* ── SSE stream toggle ── */
-function toggleStream() {
-  streamRunning = !streamRunning;
+/* ── SSE stream — auto-reconnects every 3s on error ── */
+function startStream() {
+  if (es) { try { es.close(); } catch(e) {} es = null; }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+
   const btn = document.getElementById('streamBtn');
+  btn.textContent = '■ Stop Stream';
+  btn.className = 'btn off';
+  streamRunning = true;
+
+  es = new EventSource('/api/stream');
+
+  es.onmessage = (e) => {
+    try {
+      const d = JSON.parse(e.data);
+      if (!d.entries || !d.entries.length) return;
+      renderLog(d.entries);
+      const last = d.entries[d.entries.length - 1];
+      document.getElementById('pipeline-path').textContent  = last.path  != null ? last.path  : '–';
+      document.getElementById('pipeline-model').textContent = last.resolved || last.model || '–';
+    } catch (err) {
+      console.error('SSE parse error', err);
+    }
+  };
+
+  // FIX: auto-reconnect instead of stopping permanently
+  es.onerror = () => {
+    try { es.close(); } catch(e) {}
+    es = null;
+    if (!streamRunning) return; // user manually stopped
+    // Reconnect after 3s
+    reconnectTimer = setTimeout(() => {
+      if (streamRunning) startStream();
+    }, 3000);
+  };
+}
+
+function stopStream() {
+  streamRunning = false;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (es) { try { es.close(); } catch(e) {} es = null; }
+  const btn = document.getElementById('streamBtn');
+  btn.textContent = '▶ Start Stream';
+  btn.className = 'btn';
+}
+
+function toggleStream() {
   if (streamRunning) {
-    btn.textContent = '■ Stop Stream';
-    btn.className = 'btn off';
-    es = new EventSource('/api/stream');
-    es.onmessage = (e) => {
-      try {
-        const d = JSON.parse(e.data);
-        if (!d.entries || !d.entries.length) return;
-        renderLog(d.entries);
-        const last = d.entries[d.entries.length - 1];
-        document.getElementById('pipeline-path').textContent  = last.path  != null ? last.path  : '–';
-        document.getElementById('pipeline-model').textContent = last.resolved || last.model || '–';
-      } catch (err) {
-        console.error('SSE parse error', err);
-      }
-    };
-    es.onerror = () => {
-      if (es) { es.close(); es = null; }
-      streamRunning = false;
-      const b = document.getElementById('streamBtn');
-      b.textContent = '▶ Start Stream';
-      b.className = 'btn';
-    };
+    stopStream();
   } else {
-    btn.textContent = '▶ Start Stream';
-    btn.className = 'btn';
-    if (es) { es.close(); es = null; }
+    startStream();
   }
 }
 
@@ -95,11 +117,9 @@ function renderModels(list) {
   count.textContent = '(' + list.length + ' models)';
   if (!list.length) { box.innerHTML = '<span class="dim">no models match</span>'; return; }
   box.innerHTML = list.map(id => {
-    // strip "opencode/" prefix for display; badge live models green
     const short = id.replace(/^opencode\//, '');
-    const isFast = !short.includes('-free') && short !== 'fast' && short !== 'fastest'
-      ? false : true;
-    return '<span class="model-badge' + (isFast ? ' live' : '') + '" title="' + escHtml(id) + '">'
+    const isLive = short.includes('-free') || short === 'big-pickle' || short === 'fast' || short === 'fastest';
+    return '<span class="model-badge' + (isLive ? ' live' : '') + '" title="' + escHtml(id) + '">'
       + escHtml(short) + '</span>';
   }).join('');
 }
@@ -113,6 +133,6 @@ updateClock();
 
 /* ── init ── */
 document.addEventListener('DOMContentLoaded', () => {
-  toggleStream();
+  startStream();
   loadModels();
 });

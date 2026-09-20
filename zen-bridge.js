@@ -280,14 +280,19 @@ function zenStreamResponsesToClient(res, model, chatBody) {
     const created = Math.floor(Date.now() / 1000);
 
     const safeWrite = (obj) => {
-      try { res.write("event: " + obj.type + "\ndata: " + JSON.stringify(obj) + "\n\n"); } catch {}
+      try { res.write("event: " + obj.type + "\ndata: " + JSON.stringify({ sequence_number: seq(), ...obj }) + "\n\n"); } catch {}
     };
 
+    // FIX: delay session deletion 2s — gives the opencode client time to finish
+    // processing the completed response before the session disappears.
+    // Immediate deletion caused "Session not found" and blank output in opencode UI.
     const finish = (err) => {
       if (settled) return;
       settled = true;
       if (sub) sub.close();
-      if (sessionID) callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {});
+      setTimeout(() => {
+        if (sessionID) callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {});
+      }, 2000);
       if (err) {
         if (res.headersSent) {
           // Close the stream cleanly; SDK will surface a partial result
@@ -308,14 +313,18 @@ function zenStreamResponsesToClient(res, model, chatBody) {
       }
     };
 
+    let seqNum = 0;
+    const seq = () => ++seqNum;
+
     function buildResponseObj(id, mdl, ts, text, tok, status) {
+      const isInProgress = status === "in_progress";
       return {
         id,
         object: "response",
         created_at: ts,
         model: mdl,
         status: status || "completed",
-        output: [{
+        output: isInProgress ? [] : [{
           type: "message",
           id: itemId,
           role: "assistant",
@@ -604,7 +613,10 @@ function zenStreamToClient(res, model, body) {
       if (settled) return;
       settled = true;
       if (sub) sub.close();
-      if (sessionID) callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {});
+      // Delay deletion 2s so opencode client can finish processing the response
+      setTimeout(() => {
+        if (sessionID) callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {});
+      }, 2000);
 
       if (err) {
         if (res.headersSent) {
