@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-20f — One-command installer
+
+- `scripts/install.sh`: single-command install — detects node/opencode (incl.
+  nvm and ~/.opencode paths), deploys all files, generates systemd user units
+  with machine-specific paths (no more hardcoded /home/mint), reuses an
+  existing OpenCode auth.json, writes the client config if none exists,
+  enables + starts all 4 services and verifies the bridge before reporting
+  success. Idempotent — safe to re-run.
+- `scripts/update.sh`: git pull + redeploy + restart without touching auth/logs
+- `scripts/uninstall.sh`: clean removal; `--purge` also wipes servehome,
+  activity logs and token history
+- README rewritten around the installer; old manual steps kept in a collapsed
+  <details> section with a note about the hardcoded unit paths
+- Verified live end-to-end on the host: installer run → 4 units active →
+  bridge completion 200 → dashboard reports all services listening
+
 ## 2026-09-20e — Persisted token history + context warnings
 
 - Bridge persists every completion to daily JSONL files

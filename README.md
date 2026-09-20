@@ -1,6 +1,14 @@
 # opencode-zen-loophole
 
-**Use all 40 free AI models from OpenCode — unlimited, no API key needed.**
+**Use all 31 free AI models from OpenCode — unlimited, no API key needed.**
+
+```bash
+git clone https://github.com/AmiXDme/opencode-zen-loophole.git
+cd opencode-zen-loophole
+bash scripts/install.sh     # one command, ~30 seconds
+```
+
+Then open **http://127.0.0.1:1395** — realtime usage, tokens, services, logs.
 
 This project runs a small local server on your machine that acts as a bridge between any AI coding tool and OpenCode's free AI models. It bypasses the daily usage limits by rotating IP addresses on every request.
 
@@ -122,14 +130,53 @@ opencode --version   # need any recent version
 
 ## Installation
 
-### Step 1 — Clone this repo
+### The easy way — one command
 
 ```bash
 git clone https://github.com/AmiXDme/opencode-zen-loophole.git
 cd opencode-zen-loophole
+bash scripts/install.sh
 ```
 
-### Step 2 — Create required directories
+That's it. The installer:
+
+- checks Node + OpenCode are available (nvm locations too)
+- deploys the bridge, rotator and dashboard to `~/.local/share/opencode/`
+- writes systemd **user** units with the correct paths for **your** machine (no hardcoded usernames)
+- reuses your existing OpenCode login if you have one (`auth.json` is copied into the serve home)
+- writes a client config that points opencode at the bridge (only if you don't have one)
+- enables + starts all 4 services and waits until the bridge answers
+- prints a summary with the dashboard URL and a test command
+
+Re-running it is safe — it just redeploys and restarts.
+
+If you had no OpenCode login before installing, log in once:
+
+```bash
+HOME=~/.local/share/opencode/servehome opencode auth login
+```
+
+Then restart the chain: `systemctl --user restart opencode-serve zen-bridge`
+
+### Managing the install
+
+```bash
+bash scripts/update.sh      # git pull + redeploy + restart (keeps auth/logs)
+bash scripts/uninstall.sh   # stop + remove services and deployed files
+bash scripts/uninstall.sh --purge   # also remove servehome + logs/token history
+```
+
+Services live in systemd **user** scope — no sudo needed, and they start on boot:
+
+```bash
+systemctl --user status zen-bridge opencode-serve zen-rotator opencode-dashboard
+journalctl --user -u zen-bridge.service -f
+```
+
+<details>
+<summary><b>Manual install (what the script automates)</b></summary>
+
+### 1. Create required directories
 
 ```bash
 mkdir -p ~/.local/share/opencode/servehome/.local/share/opencode
@@ -137,31 +184,25 @@ mkdir -p ~/.local/share/opencode/servehome/.config/opencode
 mkdir -p ~/.config/systemd/user
 ```
 
-### Step 3 — Copy the scripts
+### 2. Copy the scripts
 
 ```bash
-# Main bridge script
-cp scripts/zen-bridge.js   ~/.local/share/opencode/zen-bridge.js
-cp scripts/zen-rotator.js  ~/.local/share/opencode/zen-rotator.js
+cp zen-bridge.js  ~/.local/share/opencode/zen-bridge.js
+cp zen-rotator.js ~/.local/share/opencode/zen-rotator.js
 
-# Models catalog
 cp config/models-catalog.json ~/.local/share/opencode/models-catalog.json
+cp config/models-catalog.json \
+   ~/.local/share/opencode/servehome/.local/share/opencode/models-catalog.json
 
-# OpenCode config for the serve instance (points to rotator, not bridge)
 cp config/serve-opencode.json \
    ~/.local/share/opencode/servehome/.config/opencode/opencode.json
 
-# Dashboard
-mkdir -p ~/.local/share/opencode/dashboard
+mkdir -p ~/.local/share/opencode/dashboard ~/.local/share/opencode/public
 cp dashboard/dashboard-server.js ~/.local/share/opencode/dashboard/
-
-# Dashboard UI files
-mkdir -p ~/.local/share/opencode/public
-cp public/index.html public/style.css public/app.js \
-   ~/.local/share/opencode/public/
+cp public/index.html public/style.css public/app.js ~/.local/share/opencode/public/
 ```
 
-### Step 4 — Install systemd services
+### 3. Install systemd services
 
 ```bash
 cp services/zen-rotator.service      ~/.config/systemd/user/
@@ -172,28 +213,24 @@ cp services/opencode-dashboard.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 ```
 
-### Step 5 — Log in to OpenCode
+> The unit files in `services/` assume `/home/mint` and nvm node paths.
+> Edit the paths for your user, or just use `scripts/install.sh` which
+> generates them for you.
 
-You need to be logged in to OpenCode so the bridge can use your free tier:
+### 4. Log in to OpenCode
 
 ```bash
 opencode auth login
 ```
 
-Follow the prompts to log in with your OpenCode account.
-
-### Step 7 — Start everything
+### 5. Start everything
 
 ```bash
-systemctl --user enable --now zen-rotator.service
-systemctl --user enable --now opencode-serve.service
-systemctl --user enable --now zen-bridge.service
-systemctl --user enable --now opencode-dashboard.service
+systemctl --user enable --now zen-rotator.service opencode-serve.service \
+  zen-bridge.service opencode-dashboard.service
 ```
 
-The `--enable` flag makes them start automatically on every boot.
-
-### Step 8 — Configure your OpenCode client
+### 6. Configure your OpenCode client
 
 Edit your `~/.config/opencode/opencode.json` and point it at the bridge:
 
@@ -208,12 +245,7 @@ Edit your `~/.config/opencode/opencode.json` and point it at the bridge:
         "muse-spark-1.3-contributor-free",
         "deepseek-v4-flash-free",
         "nemotron-3.5-lightning-free",
-        "nemotron-3-ultra-free",
-        "mimo-v2.5-free",
-        "kimi-k2.5-free",
-        "glm-5-free",
-        "hy3-free",
-        "qwen3.6-plus-free"
+        "nemotron-3-ultra-free"
       ],
       "options": {
         "baseURL": "http://127.0.0.1:1343/v1"
@@ -224,6 +256,8 @@ Edit your `~/.config/opencode/opencode.json` and point it at the bridge:
 ```
 
 You can add or remove models from the `whitelist` array — any model ID from the table above works.
+
+</details>
 
 ---
 
@@ -393,6 +427,11 @@ opencode-zen-loophole/
 │   ├── zen-rotator.service
 │   ├── opencode-serve.service
 │   └── opencode-dashboard.service
+│
+├── scripts/
+│   ├── install.sh          ← One-command installer
+│   ├── update.sh           ← Pull + redeploy + restart
+│   └── uninstall.sh        ← Clean removal (--purge for full wipe)
 │
 ├── docs/                   ← Technical deep-dives
 ├── evidence/               ← Proof that it works
