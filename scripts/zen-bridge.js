@@ -123,7 +123,10 @@ function messagesCharCount(messages) {
 function compactChatBody(body, budget) {
   budget = budget || MAX_PROMPT_CHARS;
   const src = Array.isArray(body && body.messages) ? body.messages : [];
-  if (!src.length) return { ...body, messages: [{ role: "user", content: "ping" }] };
+  if (!src.length) {
+    console.error("Zen Bridge: compactChatBody got empty messages — refusing ping stub");
+    return { ...body, messages: [{ role: "user", content: "Please continue." }] };
+  }
 
   const system = [];
   const rest = [];
@@ -280,6 +283,34 @@ function proofHeaders(extra = {}) {
   };
 }
 
+function extractPartText(c) {
+  if (c == null) return "";
+  if (typeof c === "string") return c;
+  if (typeof c !== "object") return "";
+  if (c.type && /^(input_image|output_image|image|file|tool_call|function_call|tool_result|function_call_output)$/i.test(c.type))
+    return "";
+  return (
+    (typeof c.text === "string" && c.text) ||
+    (typeof c.content === "string" && c.content) ||
+    (typeof c.input_text === "string" && c.input_text) ||
+    (typeof c.output_text === "string" && c.output_text) ||
+    ""
+  );
+}
+
+function extractItemText(item) {
+  if (item == null) return "";
+  if (typeof item === "string") return item;
+  if (typeof item !== "object") return "";
+  if (typeof item.content === "string") return item.content;
+  if (Array.isArray(item.content))
+    return item.content.map(extractPartText).filter(Boolean).join("");
+  // Flat Responses items: {type:"input_text", text:"..."} / {type:"text", text:"..."}
+  if (item.type && /text/i.test(item.type) && typeof item.text === "string") return item.text;
+  if (typeof item.text === "string") return item.text;
+  return "";
+}
+
 function responsesBodyToChatBody(body) {
   const input = body.input;
   let messages = [];
@@ -287,33 +318,48 @@ function responsesBodyToChatBody(body) {
     messages = [{ role: "user", content: input }];
   } else if (Array.isArray(input)) {
     messages = input.map((item) => {
-      if (item && item.type === "message") {
-        const role = item.role || "user";
-        let content = "";
-        if (typeof item.content === "string") content = item.content;
-        else if (Array.isArray(item.content))
-          content = item.content.map((c) => {
-            if (typeof c === "string") return c;
-            if (!c || typeof c !== "object") return "";
-            // Skip images/files/tool-call blobs that blow context / break muse
-            if (c.type && /image|file|tool|function/i.test(c.type) && !c.text) return "";
-            return c.text || c.content || "";
-          }).filter(Boolean).join("");
-        return { role, content };
+      if (!item || typeof item !== "object") {
+        return { role: "user", content: typeof item === "string" ? item : "" };
       }
-      if (item && item.type && /tool|function|image|file/i.test(item.type))
+      if (item.type === "message" || item.role) {
+        const role = item.role || "user";
+        return { role, content: extractItemText(item) };
+      }
+      if (item.type && /^(input_image|output_image|image|file|tool_call|function_call|tool_result|function_call_output|reasoning)$/i.test(item.type))
         return { role: "user", content: "" };
-      return { role: "user", content: typeof item === "string" ? item : "" };
+      // Flat text / input_text items
+      const text = extractItemText(item);
+      if (text) {
+        const role = /output|assistant/i.test(item.type || "") ? "assistant" : "user";
+        return { role, content: text };
+      }
+      return { role: "user", content: "" };
     }).filter((m) => messageText(m).trim());
+  } else if (input && typeof input === "object") {
+    const text = extractItemText(input);
+    messages = text ? [{ role: "user", content: text }] : [];
   } else {
-    messages = [{ role: "user", content: "" }];
+    messages = [];
   }
+
   // Desktop ships enormous agent instructions — keep a short prefix only
   if (body.instructions && typeof body.instructions === "string") {
     let instr = body.instructions;
     if (instr.length > MAX_SYSTEM_CHARS) instr = instr.slice(0, MAX_SYSTEM_CHARS) + "\n…[instructions truncated]";
     messages = [{ role: "system", content: instr }, ...messages];
   }
+
+  // Never fall through to a fake "ping" prompt (models answer "pong")
+  if (!messages.some((m) => m.role !== "system" && messageText(m).trim())) {
+    const fallback =
+      (typeof body.input === "string" && body.input) ||
+      (body.prompt && String(body.prompt)) ||
+      (body.messages && Array.isArray(body.messages) && messageText(body.messages[body.messages.length - 1])) ||
+      "";
+    if (fallback.trim()) messages = [...messages.filter((m) => m.role === "system"), { role: "user", content: fallback.trim() }];
+    else console.error("Zen Bridge: empty user text after parse; raw input type=", typeof body.input, Array.isArray(body.input) ? "len="+body.input.length : "");
+  }
+
   return compactChatBody({
     model: body.model || "big-pickle",
     messages,
@@ -583,10 +629,24 @@ function subscribeEvents(onEvent) {
 }
 
 function buildParts(body) {
-  return (body.messages || []).map((m) => ({
-    type: "text", text: messageText(m),
-    id: "prt_" + crypto.randomBytes(12).toString("hex"),
-  }));
+  const parts = (body.messages || [])
+    .map((m) => {
+      const text = messageText(m).trim();
+      if (!text) return null;
+      const role = (m && m.role) || "user";
+      return {
+        type: "text",
+        text: role === "system" ? `[system]\n${text}` : role === "assistant" ? `[assistant]\n${text}` : text,
+        id: "prt_" + crypto.randomBytes(12).toString("hex"),
+      };
+    })
+    .filter(Boolean);
+  if (!parts.length) {
+    parts.push({ type: "text", text: "Please continue.", id: "prt_" + crypto.randomBytes(12).toString("hex") });
+  }
+  const last = parts[parts.length - 1];
+  console.error("Zen Bridge: prompt parts=", parts.length, "last=", String(last.text || "").slice(0, 120).replace(/\n/g, " "));
+  return parts;
 }
 
 // ── Chat completions SSE streaming ───────────────────────────────────────────
