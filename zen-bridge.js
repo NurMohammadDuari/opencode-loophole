@@ -31,6 +31,11 @@ const FAST_RACE = process.env.FAST_RACE === "1";
 const ZEN_TIMEOUT_MS = Number(process.env.ZEN_TIMEOUT_MS || 90000);
 // Shorter timeout for remapped (non-zen-live) models
 const ZEN_REMAP_TIMEOUT_MS = Number(process.env.ZEN_REMAP_TIMEOUT_MS || 30000);
+// Desktop agent turns often ship huge histories; keep under zen context limits
+const MAX_PROMPT_CHARS = Number(process.env.MAX_PROMPT_CHARS || 28000);
+const MAX_SYSTEM_CHARS = Number(process.env.MAX_SYSTEM_CHARS || 6000);
+const EMPTY_STREAM_GRACE_MS = Number(process.env.EMPTY_STREAM_GRACE_MS || 25000);
+const VARIANT_SUFFIX_RE = /-(?:xhigh|high|max|medium|low|fast|thinking|mini|nano)$/i;
 
 const SHARE = path.join(os.homedir(), ".local", "share", "opencode");
 const ACTIVITY_LOG = process.env.BRIDGE_ACTIVITY_LOG || path.join(SHARE, "bridge-activity.jsonl");
@@ -90,7 +95,10 @@ function readRotatorTail(n = 5) {
 
 function modelName(m) {
   if (typeof m !== "string") return "big-pickle";
-  return m.split("/").pop().replace(/^opencode:/, "");
+  let raw = m.split("/").pop().replace(/^opencode:/, "");
+  // Desktop "variant: xhigh" sometimes appends -xhigh to the model id
+  raw = raw.replace(VARIANT_SUFFIX_RE, "");
+  return raw || "big-pickle";
 }
 
 function resolveZenModel(m) {
@@ -105,6 +113,67 @@ function resolveZenModel(m) {
   if (WHITELIST.includes(raw))
     return { requested: raw, zenModel: raw, remapped: false };
   return { requested: raw, zenModel: "big-pickle", remapped: true };
+}
+
+function messagesCharCount(messages) {
+  return (messages || []).reduce((n, m) => n + messageText(m).length, 0);
+}
+
+/** Keep last turns under MAX_PROMPT_CHARS so zen/desktop agent history does not overflow. */
+function compactChatBody(body, budget) {
+  budget = budget || MAX_PROMPT_CHARS;
+  const src = Array.isArray(body && body.messages) ? body.messages : [];
+  if (!src.length) return { ...body, messages: [{ role: "user", content: "ping" }] };
+
+  const system = [];
+  const rest = [];
+  for (const m of src) {
+    if (m && m.role === "system") system.push(m);
+    else rest.push(m);
+  }
+
+  let sysText = system.map(messageText).join("\n\n").trim();
+  if (sysText.length > MAX_SYSTEM_CHARS)
+    sysText = sysText.slice(0, MAX_SYSTEM_CHARS) + "\n…[system truncated]";
+
+  const kept = [];
+  let used = sysText.length;
+  for (let i = rest.length - 1; i >= 0; i--) {
+    const text = messageText(rest[i]);
+    const role = (rest[i] && rest[i].role) || "user";
+    if (!text.trim()) continue;
+    if (kept.length && used + text.length > budget) break;
+    let slice = text;
+    if (!kept.length && text.length > budget) {
+      slice = text.slice(-Math.floor(budget * 0.9)) + "\n…[message truncated]";
+    }
+    kept.unshift({ role, content: slice });
+    used += slice.length;
+  }
+  if (!kept.length) {
+    const last = rest[rest.length - 1] || src[src.length - 1];
+    kept.push({ role: (last && last.role) || "user", content: messageText(last).slice(-8000) || "hello" });
+  }
+
+  const messages = [];
+  if (sysText) messages.push({ role: "system", content: sysText });
+  messages.push(...kept);
+  if (messagesCharCount(src) > messagesCharCount(messages))
+    console.error("Zen Bridge: compacted messages", messagesCharCount(src), "->", messagesCharCount(messages), "parts", messages.length);
+  return { ...body, messages };
+}
+
+function lastUserOnlyBody(body) {
+  const msgs = (body && body.messages) || [];
+  let lastUser = null;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i] && msgs[i].role === "user" && messageText(msgs[i]).trim()) {
+      lastUser = { role: "user", content: messageText(msgs[i]).slice(-12000) };
+      break;
+    }
+  }
+  if (!lastUser) lastUser = { role: "user", content: "Continue." };
+  return { ...body, messages: [lastUser] };
 }
 
 function normalizeBridgePath(raw) {
@@ -129,26 +198,34 @@ function extractAssistantText(messages) {
   return { text, tokens };
 }
 
-/** When stream idles with no text, sync-retry same model then big-pickle. */
+/** When stream idles with no text, sync-retry same model then big-pickle (compacted). */
 async function recoverTextAfterEmpty(model, chatBody) {
-  const tried = [];
-  for (const mdl of [model, "big-pickle"]) {
-    if (tried.includes(mdl)) continue;
-    tried.push(mdl);
-    try {
-      const result = await zenOnce(mdl, chatBody);
-      const text = ((((result.openaiRes || {}).choices || [])[0] || {}).message || {}).content || "";
-      if (text && String(text).trim()) {
-        return {
-          text: String(text),
-          model: mdl,
-          tokens: (result.openaiRes && result.openaiRes.usage) || null,
-          path: mdl === model ? "zen-sync-recover" : "zen-bigpickle-recover",
-          sessionID: result.sessionID,
-        };
+  const bodies = [
+    compactChatBody(chatBody, MAX_PROMPT_CHARS),
+    compactChatBody(chatBody, 12000),
+    lastUserOnlyBody(chatBody),
+  ];
+  const models = [model, "big-pickle"];
+  for (const body of bodies) {
+    for (const mdl of models) {
+      try {
+        const result = await zenOnce(mdl, body, 45000);
+        const text = ((((result.openaiRes || {}).choices || [])[0] || {}).message || {}).content || "";
+        if (text && String(text).trim()) {
+          return {
+            text: String(text),
+            model: mdl,
+            tokens: (result.openaiRes && result.openaiRes.usage) || null,
+            path: mdl === model ? "zen-sync-recover" : "zen-bigpickle-recover",
+            sessionID: result.sessionID,
+          };
+        }
+      } catch (e) {
+        const msg = e.message || "";
+        console.error("Zen Bridge: recover via", mdl, "failed:", msg.slice(0, 220));
+        // Overflow / invalid params → try smaller body next
+        if (/ContextOverflow|invalid_request|invalid parameters|too large/i.test(msg)) continue;
       }
-    } catch (e) {
-      console.error("Zen Bridge: recover via", mdl, "failed:", e.message);
     }
   }
   return null;
@@ -215,28 +292,41 @@ function responsesBodyToChatBody(body) {
         let content = "";
         if (typeof item.content === "string") content = item.content;
         else if (Array.isArray(item.content))
-          content = item.content.map((c) => (typeof c === "string" ? c : c.text || c.content || "")).join("");
+          content = item.content.map((c) => {
+            if (typeof c === "string") return c;
+            if (!c || typeof c !== "object") return "";
+            // Skip images/files/tool-call blobs that blow context / break muse
+            if (c.type && /image|file|tool|function/i.test(c.type) && !c.text) return "";
+            return c.text || c.content || "";
+          }).filter(Boolean).join("");
         return { role, content };
       }
-      return { role: "user", content: typeof item === "string" ? item : JSON.stringify(item) };
-    });
+      if (item && item.type && /tool|function|image|file/i.test(item.type))
+        return { role: "user", content: "" };
+      return { role: "user", content: typeof item === "string" ? item : "" };
+    }).filter((m) => messageText(m).trim());
   } else {
     messages = [{ role: "user", content: "" }];
   }
-  if (body.instructions && typeof body.instructions === "string")
-    messages = [{ role: "system", content: body.instructions }, ...messages];
-  return {
+  // Desktop ships enormous agent instructions — keep a short prefix only
+  if (body.instructions && typeof body.instructions === "string") {
+    let instr = body.instructions;
+    if (instr.length > MAX_SYSTEM_CHARS) instr = instr.slice(0, MAX_SYSTEM_CHARS) + "\n…[instructions truncated]";
+    messages = [{ role: "system", content: instr }, ...messages];
+  }
+  return compactChatBody({
     model: body.model || "big-pickle",
     messages,
     stream: !!body.stream,
     temperature: body.temperature,
     max_tokens: body.max_output_tokens || body.max_tokens,
-  };
+  });
 }
 
 // ── Responses API SSE streaming ──────────────────────────────────────────────
 function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
   timeoutMs = timeoutMs || ZEN_TIMEOUT_MS;
+  chatBody = compactChatBody(chatBody);
   return new Promise(async (resolve, reject) => {
     const t0 = Date.now();
     let sessionID = null;
@@ -325,8 +415,14 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
       const timer = setTimeout(() => finish(new Error("zen responses stream timeout")), timeoutMs);
 
       let lastDeltaAt = Date.now();
+      const streamStartedAt = Date.now();
       const stallCheck = setInterval(() => {
         if (settled) { clearInterval(stallCheck); return; }
+        // No text at all after grace → recover instead of waiting full timeout (desktop "thinking" forever)
+        if (fullText.length === 0 && Date.now() - streamStartedAt > EMPTY_STREAM_GRACE_MS) {
+          clearInterval(stallCheck); clearTimeout(timer); flushAndFinish();
+          return;
+        }
         if (fullText.length > 0 && Date.now() - lastDeltaAt > 15000) {
           clearInterval(stallCheck); clearTimeout(timer); flushAndFinish();
         }
@@ -496,6 +592,7 @@ function buildParts(body) {
 // ── Chat completions SSE streaming ───────────────────────────────────────────
 function zenStreamToClient(res, model, body, timeoutMs) {
   timeoutMs = timeoutMs || ZEN_TIMEOUT_MS;
+  body = compactChatBody(body);
   return new Promise(async (resolve, reject) => {
     const t0 = Date.now();
     let sessionID = null;
@@ -554,8 +651,14 @@ function zenStreamToClient(res, model, body, timeoutMs) {
       const timer = setTimeout(() => finish(new Error("zen stream timeout")), timeoutMs);
 
       let lastDeltaAt = Date.now();
+      const streamStartedAt = Date.now();
       const stallCheck = setInterval(() => {
         if (settled) { clearInterval(stallCheck); return; }
+        if (fullText.length === 0 && Date.now() - streamStartedAt > EMPTY_STREAM_GRACE_MS) {
+          clearInterval(stallCheck); clearTimeout(timer);
+          recoverOrFinish();
+          return;
+        }
         if (fullText.length > 0 && Date.now() - lastDeltaAt > 15000) {
           clearInterval(stallCheck); clearTimeout(timer);
           if (!res.headersSent) return;
@@ -568,6 +671,58 @@ function zenStreamToClient(res, model, body, timeoutMs) {
           finish(null);
         }
       }, 2000);
+
+      async function recoverOrFinish() {
+        if (settled) return;
+        if (fullText !== "") {
+          try {
+            res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+            res.write("data: [DONE]\n\n");
+            res.end();
+          } catch {}
+          writeProof({ path: "zen-stream", sessionID, model, ms: Date.now() - t0, chars: fullText.length, tokens, rotator: readRotatorTail(3), sample: fullText.slice(0, 160) });
+          finish(null);
+          return;
+        }
+        try {
+          const r = await callServe("GET", `/session/${sessionID}/message`, null, 8000);
+          if (settled) return;
+          if (r.status === 200) {
+            const got = extractAssistantText(r.json);
+            if (got.text) { fullText = got.text; if (got.tokens) tokens = got.tokens; }
+          }
+        } catch {}
+        if (settled) return;
+        if (fullText === "") {
+          console.error("Zen Bridge: idle-no-delta for", model, "— recovering via sync/big-pickle");
+          const recovered = await recoverTextAfterEmpty(model, body);
+          if (settled) return;
+          if (recovered && recovered.text) {
+            fullText = recovered.text;
+            if (recovered.tokens) tokens = recovered.tokens;
+            try {
+              res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: fullText }, finish_reason: null }] })}\n\n`);
+              res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+              res.write("data: [DONE]\n\n");
+              res.end();
+            } catch {}
+            writeProof({ path: recovered.path, sessionID, model, ms: Date.now() - t0, chars: fullText.length, tokens, rotator: readRotatorTail(3), sample: fullText.slice(0, 160) });
+            finish(null);
+            return;
+          }
+          console.error("Zen Bridge: idle-no-delta for", model, "— recovery also empty");
+          finish(new Error("idle-with-no-text"));
+          return;
+        }
+        try {
+          res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: fullText }, finish_reason: null }] })}\n\n`);
+          res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
+        } catch {}
+        writeProof({ path: "zen-stream-fetched", sessionID, model, ms: Date.now() - t0, chars: fullText.length, tokens, rotator: readRotatorTail(3), sample: fullText.slice(0, 160) });
+        finish(null);
+      }
 
       sub = subscribeEvents((evt) => {
         if (settled) return;
@@ -600,54 +755,7 @@ function zenStreamToClient(res, model, body, timeoutMs) {
 
         if (isIdle) {
           clearTimeout(timer); clearInterval(stallCheck);
-          // Idle fired with no deltas — fetch text directly from serve session messages
-          if (fullText === "") {
-            callServe("GET", `/session/${sessionID}/message`, null, 8000)
-              .then(async (r) => {
-                if (settled) return;
-                if (r.status === 200) {
-                  const got = extractAssistantText(r.json);
-                  if (got.text) { fullText = got.text; if (got.tokens) tokens = got.tokens; }
-                }
-                if (fullText === "") {
-                  console.error("Zen Bridge: idle-no-delta for", model, "— recovering via sync/big-pickle");
-                  const recovered = await recoverTextAfterEmpty(model, body);
-                  if (recovered && recovered.text) {
-                    fullText = recovered.text;
-                    if (recovered.tokens) tokens = recovered.tokens;
-                    try {
-                      res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: fullText }, finish_reason: null }] })}\n\n`);
-                      res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
-                      res.write("data: [DONE]\n\n");
-                      res.end();
-                    } catch {}
-                    writeProof({ path: recovered.path, sessionID, model, ms: Date.now() - t0, chars: fullText.length, tokens, rotator: readRotatorTail(3), sample: fullText.slice(0, 160) });
-                    finish(null);
-                    return;
-                  }
-                  console.error("Zen Bridge: idle-no-delta for", model, "— recovery also empty");
-                  finish(new Error("idle-with-no-text"));
-                } else {
-                  try {
-                    res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: fullText }, finish_reason: null }] })}\n\n`);
-                    res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
-                    res.write("data: [DONE]\n\n");
-                    res.end();
-                  } catch {}
-                  writeProof({ path: "zen-stream-fetched", sessionID, model, ms: Date.now() - t0, chars: fullText.length, tokens, rotator: readRotatorTail(3), sample: fullText.slice(0, 160) });
-                  finish(null);
-                }
-              })
-              .catch((e) => { if (!settled) finish(new Error("fetch-after-idle failed: " + e.message)); });
-            return;
-          }
-          try {
-            res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
-            res.write("data: [DONE]\n\n");
-            res.end();
-          } catch {}
-          writeProof({ path: "zen-stream", sessionID, model, ms: Date.now() - t0, chars: fullText.length, tokens, rotator: readRotatorTail(3), sample: fullText.slice(0, 160) });
-          finish(null);
+          recoverOrFinish();
         }
       });
 
@@ -665,7 +773,9 @@ function zenStreamToClient(res, model, body, timeoutMs) {
 }
 
 // ── Non-stream: sync /message ─────────────────────────────────────────────────
-async function zenOnce(model, body) {
+async function zenOnce(model, body, timeoutOverride) {
+  const chatBody = compactChatBody(body);
+  const timeoutMs = timeoutOverride || ZEN_TIMEOUT_MS;
   const session = await callServe("POST", "/session", { directory: null }, 15000);
   if (session.status !== 200 || !session.json || !session.json.id)
     throw Object.assign(new Error("serve session failed: " + session.status), { status: session.status });
@@ -673,14 +783,17 @@ async function zenOnce(model, body) {
   try {
     const msg = await callServe("POST", `/session/${sessionID}/message`, {
       model: { providerID: "opencode", modelID: model },
-      parts: buildParts(body),
-    }, ZEN_TIMEOUT_MS);
+      parts: buildParts(chatBody),
+    }, timeoutMs);
     if (msg.status !== 200)
       throw Object.assign(new Error("serve message failed: " + msg.status + " " + (msg.raw || "").slice(0, 200)), { status: msg.status });
     if (msg.json && msg.json.name === "UnknownError")
       throw Object.assign(new Error("serve UnknownError: " + ((msg.json.data && msg.json.data.message) || "")), { status: 500 });
-    if (msg.json && msg.json.info && msg.json.info.error)
-      throw Object.assign(new Error("serve model error: " + JSON.stringify(msg.json.info.error).slice(0, 240)), { status: 502 });
+    if (msg.json && msg.json.info && msg.json.info.error) {
+      const errObj = msg.json.info.error;
+      const errMsg = typeof errObj === "string" ? errObj : JSON.stringify(errObj);
+      throw Object.assign(new Error("serve model error: " + errMsg.slice(0, 240)), { status: 502 });
+    }
 
     const parts = [];
     const walk = (node) => {
@@ -709,6 +822,7 @@ async function zenOnce(model, body) {
 
 // ── handleChat ───────────────────────────────────────────────────────────────
 async function handleChat(res, body, stream) {
+  body = compactChatBody(body);
   const resolved = resolveZenModel(body.model);
   const requested = resolved.requested;
   let zenModel = resolved.zenModel;

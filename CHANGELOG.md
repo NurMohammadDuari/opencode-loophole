@@ -16,3 +16,10 @@ All notable changes to this project will be documented in this file.
 - On stream idle-with-no-text: sync-recover same model, then big-pickle (fixes desktop "[zen: no response]")
 - Remap non-live whitelist models (remap was previously skipped for whitelist ids)
 - Remove g4f from client configs, dashboard services, and restart-all
+
+## 2026-09-20b — Desktop 10min thinking / ContextOverflow
+
+- Compact huge desktop agent histories before zen (MAX_PROMPT_CHARS)
+- Recover empty streams with truncated then last-user-only bodies
+- Strip -xhigh/-high model suffixes; empty-stream grace 25s (no 150s hang)
+- Skip tool/image blobs that trigger muse invalid_request_error
