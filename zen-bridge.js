@@ -29,7 +29,7 @@ const SERVE_USER = process.env.SERVE_USER || "opencode";
 const SERVE_PASS = process.env.SERVE_PASS || "opencodepass";
 const PORT = process.env.BRIDGE_PORT ? Number(process.env.BRIDGE_PORT) : 1343;
 const FAST_RACE = process.env.FAST_RACE === "1";
-const ZEN_TIMEOUT_MS = Number(process.env.ZEN_TIMEOUT_MS || 180000);
+const ZEN_TIMEOUT_MS = Number(process.env.ZEN_TIMEOUT_MS || 900000);
 // Desktop agent turns often ship huge histories; keep under zen context limits
 const MAX_PROMPT_CHARS = Number(process.env.MAX_PROMPT_CHARS || 28000);
 const MAX_SYSTEM_CHARS = Number(process.env.MAX_SYSTEM_CHARS || 6000);
@@ -47,7 +47,7 @@ const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 90000);
 // Silence tolerated mid-stream before we finalize. Reasoning models often pause
 // 30-60s between text bursts while thinking; killing at 15s truncated long
 // answers at roughly the first 100 words.
-const STREAM_STALL_MS = Number(process.env.STREAM_STALL_MS || 45000);
+const STREAM_STALL_MS = Number(process.env.STREAM_STALL_MS || 90000);
 // OpenCode's built-in agent prompt brands every session as "Muse Spark", so all
 // models introduced themselves with "My name is Muse Spark." This system tag is
 // prepended to every forwarded system prompt to override that identity.
@@ -268,12 +268,14 @@ function extractAssistantText(messages) {
 
 /** When stream idles with no text, retry with progressively smaller bodies + big-pickle. */
 async function recoverTextAfterEmpty(model, chatBody) {
+  // big-pickle first: it is the fastest, most reliable model, and the original
+  // model just stalled once already. Bodies go smallest-context first.
   const bodies = [
-    compactChatBody(chatBody, MAX_PROMPT_CHARS),
     compactChatBody(chatBody, 12000),
+    compactChatBody(chatBody, MAX_PROMPT_CHARS),
     lastUserOnlyBody(chatBody),
   ];
-  const models = [model, "big-pickle"];
+  const models = ["big-pickle", model];
   // Bounded fan-out: 3 attempts max so a dead upstream fails in seconds, not minutes.
   const attempts = Math.min(RECOVERY_MAX_ATTEMPTS, bodies.length * models.length);
   for (let i = 0; i < attempts; i++) {
@@ -448,6 +450,11 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
     let tokens = null;
     let settled = false;
     let sub = null;
+    // Part-type tracking: OpenCode emits reasoning and answer text as
+    // SEPARATE parts (reasoning comes first). Delta events only carry a
+    // partID, so we classify parts by type when they are announced.
+    const reasoningPartIds = new Set();
+    const textPartIds = new Set();
     const respId = "resp_" + crypto.randomBytes(12).toString("hex");
     const itemId = "item_" + crypto.randomBytes(8).toString("hex");
     const created = Math.floor(Date.now() / 1000);
@@ -456,7 +463,7 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
       try { res.write("event: " + obj.type + "\ndata: " + JSON.stringify({ sequence_number: seq(), ...obj }) + "\n\n"); } catch {}
     };
 
-    const finish = (err) => {
+    let finish = (err) => {
       if (settled) return;
       settled = true;
       if (sub) sub.close();
@@ -527,14 +534,24 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
 
       const timer = setTimeout(() => finish(new Error("zen responses stream timeout")), timeoutMs);
 
+      // Activity tracking: reasoning and tool phases are NORMAL for heavy
+      // models (muse-spark can think 3-5 minutes on big agent prompts).
+      // Any of these events counts as "the model is alive" and resets the
+      // stall timer — only a truly silent upstream should time out.
       let lastDeltaAt = Date.now();
       const streamStartedAt = Date.now();
+      const heartbeat = setInterval(() => {
+        if (settled) { clearInterval(heartbeat); return; }
+        try { res.write(": keep-alive\n\n"); } catch {}
+      }, 10000);
+      const stopHeartbeat = () => clearInterval(heartbeat);
+      finish = ((orig) => (err) => { stopHeartbeat(); return orig(err); })(finish);
       const stallCheck = setInterval(() => {
         if (settled) { clearInterval(stallCheck); return; }
-        // No text at all after grace → recover instead of waiting full timeout (desktop "thinking" forever)
-        if (fullText.length === 0 && Date.now() - streamStartedAt > EMPTY_STREAM_GRACE_MS) {
+        // No text AND no other activity after grace → recover
+        if (fullText.length === 0 && Date.now() - lastDeltaAt > EMPTY_STREAM_GRACE_MS) {
           clearInterval(stallCheck); clearTimeout(timer);
-          console.error("Zen Bridge: no first delta after", EMPTY_STREAM_GRACE_MS, "ms for", model, "— recovering");
+          console.error("Zen Bridge: no activity after", EMPTY_STREAM_GRACE_MS, "ms for", model, "— recovering");
           flushAndFinish();
           return;
         }
@@ -603,30 +620,47 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
         const props = evt.properties || {};
         if (props.sessionID && props.sessionID !== sessionID) return;
 
-        if (type === "message.updated") {
-          const info = props.info || {};
-          if (info.role === "assistant" && info.id) { assistantMsgId = info.id; if (info.tokens) tokens = info.tokens; }
-        }
-
-        if (type === "message.part.delta") {
-          if (assistantMsgId && props.messageID && props.messageID !== assistantMsgId) return;
-          if (props.field && props.field !== "text") return;
-          const delta = props.delta || "";
-          if (!delta) return;
-          if (!assistantMsgId && props.messageID) assistantMsgId = props.messageID;
-          fullText += delta;
-          lastDeltaAt = Date.now();
-          safeWrite({ type: "response.output_text.delta", item_id: itemId, output_index: 0, content_index: 0, delta });
-        }
-
         const isIdle =
           type === "session.idle" ||
           (type === "session.status" && props.status && props.status.type === "idle") ||
           (type === "session.updated" && props.session && props.session.time && props.session.time.completed);
 
-        // If we already streamed text, idle means DONE — never touch the session
-        // after this point (early DELETE caused FOREIGN KEY failures + blank output).
-        if (isIdle && fullText !== "") { clearTimeout(timer); clearInterval(stallCheck); flushAndFinish(); }
+        // ANY event (message updates, part updates, tool events, deltas)
+        // means serve is alive — long tool runs and reasoning phases are
+        // normal. Only true silence should trip the stall timer.
+        if (!isIdle) lastDeltaAt = Date.now();
+
+        if (type === "message.updated") {
+          const info = props.info || {};
+          if (info.role === "assistant" && info.id) { assistantMsgId = info.id; if (info.tokens) tokens = info.tokens; }
+        }
+
+        if (type === "message.part.updated" || type === "message.part-updated") {
+          const part = props.part || {};
+          if (part && part.id) {
+            if (part.type === "reasoning") { reasoningPartIds.add(part.id); textPartIds.delete(part.id); }
+            else if (part.type === "text") { textPartIds.add(part.id); reasoningPartIds.delete(part.id); }
+          }
+        }
+
+        if (type === "message.part.delta") {
+          if (assistantMsgId && props.messageID && props.messageID !== assistantMsgId) return;
+          const pid = props.partID || null;
+          const delta = props.delta || "";
+          if (!delta) return;
+          if (!assistantMsgId && props.messageID) assistantMsgId = props.messageID;
+          // Reasoning parts are normal — but never leak into the answer stream.
+          const isReasoning = pid ? reasoningPartIds.has(pid) : false;
+          const isText = pid ? textPartIds.has(pid) : true; // unknown pid → assume text
+          if (isReasoning || !isText) return;
+          fullText += delta;
+          safeWrite({ type: "response.output_text.delta", item_id: itemId, output_index: 0, content_index: 0, delta });
+        }
+
+        // Idle = the run finished (or died). flushAndFinish handles both:
+        // text already streamed → clean end; nothing streamed → fetch the
+        // stored message, and recover if that is empty too.
+        if (isIdle) { clearTimeout(timer); clearInterval(stallCheck); flushAndFinish(); }
       });
 
       await new Promise((r) => setTimeout(r, 80));
@@ -741,6 +775,9 @@ function zenStreamToClient(res, model, body, timeoutMs) {
     let tokens = null;
     let settled = false;
     let sub = null;
+    // Part-type tracking (see zenStreamResponsesToClient)
+    const reasoningPartIds = new Set();
+    const textPartIds = new Set();
     const chatId = "chatcmpl-" + crypto.randomBytes(8).toString("hex");
 
     const finish = (err) => {
@@ -871,30 +908,46 @@ function zenStreamToClient(res, model, body, timeoutMs) {
         const props = evt.properties || {};
         if (props.sessionID && props.sessionID !== sessionID) return;
 
-        if (type === "message.updated") {
-          const info = props.info || {};
-          if (info.role === "assistant" && info.id) { assistantMsgId = info.id; if (info.tokens) tokens = info.tokens; }
-        }
-
-        if (type === "message.part.delta") {
-          if (assistantMsgId && props.messageID && props.messageID !== assistantMsgId) return;
-          if (props.field && props.field !== "text") return;
-          const delta = props.delta || "";
-          if (!delta) return;
-          if (!assistantMsgId && props.messageID) assistantMsgId = props.messageID;
-          fullText += delta;
-          lastDeltaAt = Date.now();
-          try {
-            res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] })}\n\n`);
-          } catch {}
-        }
-
         const isIdle =
           type === "session.idle" ||
           (type === "session.status" && props.status && props.status.type === "idle") ||
           (type === "session.updated" && props.session && props.session.time && props.session.time.completed);
 
-        if (isIdle && fullText !== "") {
+        // ANY event = serve alive (tool runs / reasoning produce no text
+        // deltas but ARE progress). Only true silence trips the stall timer.
+        if (!isIdle) lastDeltaAt = Date.now();
+
+        if (type === "message.updated") {
+          const info = props.info || {};
+          if (info.role === "assistant" && info.id) { assistantMsgId = info.id; if (info.tokens) tokens = info.tokens; }
+        }
+
+        if (type === "message.part.updated" || type === "message.part-updated") {
+          const part = props.part || {};
+          if (part && part.id) {
+            if (part.type === "reasoning") { reasoningPartIds.add(part.id); textPartIds.delete(part.id); }
+            else if (part.type === "text") { textPartIds.add(part.id); reasoningPartIds.delete(part.id); }
+          }
+        }
+
+        if (type === "message.part.delta") {
+          if (assistantMsgId && props.messageID && props.messageID !== assistantMsgId) return;
+          const pid = props.partID || null;
+          const delta = props.delta || "";
+          if (!delta) return;
+          if (!assistantMsgId && props.messageID) assistantMsgId = props.messageID;
+          const isReasoning = pid ? reasoningPartIds.has(pid) : false;
+          const isText = pid ? textPartIds.has(pid) : true;
+          if (isReasoning || !isText) return; // hide reasoning from the answer stream
+          fullText += delta;
+          try {
+            res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] })}\n\n`);
+          } catch {}
+        }
+
+        // Idle = run finished (or died). recoverOrFinish streams the stored
+        // text if none arrived via deltas, then recovers if that is empty too.
+        if (isIdle) {
           clearTimeout(timer); clearInterval(stallCheck);
           recoverOrFinish();
         }

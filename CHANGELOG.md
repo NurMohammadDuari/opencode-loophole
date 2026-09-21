@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-21e — App-path stability: reasoning-aware streaming, sane timeouts
+
+Root causes found for "app starts, then stops outputting / blank replies"
+(heavy models on the Responses path):
+
+- **Hard timeout killed long agent turns mid-run** (180s): real agent work
+  (reasoning → tools → tools → text) legitimately runs longer. Raised to 900s
+  (tunable ZEN_TIMEOUT_MS). This caused the zen-stream-partial at 180s seen in
+  the logs during a real reverse-engineering session.
+- **Reasoning deltas leaked into answers / answer hidden**: OpenCode streams
+  reasoning and answer as SEPARATE parts (reasoning first) but delta events
+  only carry a partID. The bridge now classifies parts by type via
+  message.part.updated (reasoning → hidden from output; text → answer) in both
+  stream paths.
+- **Idle detection counted only text**: a run that died or finished without
+  streaming text hung until the hard timeout. Now ANY event (tool runs, part
+  updates, reasoning deltas) counts as activity, and session.idle always
+  finalizes — fetching the stored message text via sync when no deltas
+  arrived (fixes blank output; text is in the DB, it just never streamed).
+- **Stall window 45s → 90s** (tunable STREAM_STALL_MS): muse-spark pauses
+  >45s between reasoning phases on big prompts.
+- **SSE heartbeat every 10s** (`: keep-alive`) on the Responses path so
+  proxies/clients don't kill idle connections during long thinking.
+- **Recovery order flipped**: big-pickle is tried FIRST on empty-stream
+  recovery (fastest, most reliable), then the original model with smaller
+  bodies.
+
+Verified: Responses-path tests on muse-spark-1.2 (478 / 346 / 1523 words,
+all clean response.completed, no reasoning leak), CLI long answer OK.
+
 ## 2026-09-21d — Weekly auto-triage of all models
 
 - `scripts/model-triage.py`: tests every whitelisted model id through the
