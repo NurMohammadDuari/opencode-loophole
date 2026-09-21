@@ -142,6 +142,13 @@ systemctl --user daemon-reload
 systemctl --user enable --quiet zen-rotator.service opencode-serve.service zen-bridge.service opencode-dashboard.service
 systemctl --user restart zen-rotator.service opencode-serve.service zen-bridge.service opencode-dashboard.service
 
+# weekly model triage (timer re-tests all models and refreshes the catalog)
+cp services/zen-model-triage.service services/zen-model-triage.timer "$UNIT_DIR/"
+mkdir -p "$SHARE/scripts"
+cp scripts/model-triage.py "$SHARE/scripts/"
+systemctl --user daemon-reload
+systemctl --user enable --quiet --now zen-model-triage.timer
+
 # ── verify ───────────────────────────────────────────────────────────────────
 say "Waiting for services to come up…"
 ok=0
@@ -168,6 +175,7 @@ cat <<'SUMMARY'
            -d '{"model":"big-pickle","messages":[{"role":"user","content":"say OK"}]}'
 
     Manage : systemctl --user status zen-bridge opencode-serve zen-rotator opencode-dashboard
+    Models : systemctl --user list-timers zen-model-triage.timer   (weekly auto-retest)
     Update : bash scripts/update.sh
     Remove : bash scripts/uninstall.sh
 SUMMARY

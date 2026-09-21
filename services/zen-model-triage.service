@@ -1,0 +1,8 @@
+[Unit]
+Description=opencode-zen-loophole: weekly model triage (retests all models, updates catalog)
+After=zen-bridge.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env python3 %h/.local/share/opencode/scripts/model-triage.py --quiet
+# results land in ~/.local/share/opencode/model-triage-last.json

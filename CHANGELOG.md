@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-21d — Weekly auto-triage of all models
+
+- `scripts/model-triage.py`: tests every whitelisted model id through the
+  bridge (paced 2s apart), detects which models serve AS THEMSELVES, then
+  rebuilds `zen_live_free` + `remap_to_zen_live` — keeping working manual
+  targets, preferring same-family remaps (ling→ling, mimo→mimo, …), falling
+  back to big-pickle/muse-spark. Aliases and context limits preserved.
+- Safety rails: refuses to rewrite the catalog if the bridge is down or too
+  few models are live (gateway outage), always keeps big-pickle as anchor.
+- Deploys the fresh catalog to repo + all three runtime locations and
+  restarts the bridge; writes a summary to
+  `~/.local/share/opencode/model-triage-last.json`.
+- `zen-model-triage.service` + `.timer`: systemd user timer, Sundays 04:17,
+  Persistent=true (catches up if the machine was off), randomized ±20min.
+  Enabled automatically by install.sh and update.sh.
+- First live run: 31 tested, 7 self-served, 0 remap changes needed — catalog
+  confirmed optimal without manual work.
+
 ## 2026-09-21c — Dashboard reflects the new fixes
 
 - **Token History panel was empty**: the dashboard read

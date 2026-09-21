@@ -1,0 +1,10 @@
+[Unit]
+Description=opencode-zen-loophole: run model triage weekly (Sun 04:17)
+
+[Timer]
+OnCalendar=Sun *-*-* 04:17:00
+Persistent=true
+RandomizedDelaySec=20min
+
+[Install]
+WantedBy=timers.target

@@ -29,6 +29,11 @@ cp config/models-catalog.json "$SERVEHOME/.local/share/opencode/models-catalog.j
 cp config/serve-opencode.json "$SERVEHOME/.config/opencode/opencode.json"
 cp dashboard/dashboard-server.js "$SHARE/dashboard/"
 cp public/index.html public/style.css public/app.js "$SHARE/public/"
+mkdir -p "$SHARE/scripts"
+cp scripts/model-triage.py "$SHARE/scripts/"
+cp services/zen-model-triage.service services/zen-model-triage.timer "$HOME/.config/systemd/user/"
+systemctl --user daemon-reload
+systemctl --user enable --quiet --now zen-model-triage.timer
 
 say "Restarting services…"
 systemctl --user restart zen-rotator.service opencode-serve.service zen-bridge.service zen-proxy.service opencode-dashboard.service
