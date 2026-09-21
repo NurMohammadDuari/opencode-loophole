@@ -34,6 +34,8 @@ function renderUsage(usage) {
   $("u-intok").textContent = fmt(t.inTok);
   $("u-outtok").textContent = fmt(t.outTok);
   $("u-tok").textContent = fmt(t.totalTok);
+  const reEl = $("u-retok");
+  if (reEl) reEl.textContent = fmt(t.reasoningTok || 0);
   $("u-req-min").textContent = (t.lastMinCount || 0) + "/min";
   $("u-rate").textContent = t.requests ? Math.round((t.ok / t.requests) * 100) + "%" : "–";
   $("u-inchars").textContent = fmt(t.inChars) + " chars sent";
@@ -60,7 +62,8 @@ function renderChart(minutes) {
     const fail = m.fail > 0;
     const tip = new Date(m.ts).toLocaleTimeString() + " — " + m.count + " req"
       + (m.fail ? ", " + m.fail + " failed" : "")
-      + (m.inTok || m.outTok ? ", tok " + m.inTok + "/" + m.outTok : "");
+      + (m.inTok || m.outTok ? ", tok " + m.inTok + "/" + m.outTok : "")
+      + (m.reasoningTok ? ", R " + m.reasoningTok : "");
     return '<div class="bar' + (fail ? " bad" : "") + '" style="height:' + h + '%" title="' + escHtml(tip) + '"></div>';
   }).join("");
 }
@@ -71,6 +74,9 @@ function fmtTokens(tok) {
   const i = tok.input || tok.prompt || 0;
   const o = tok.output || tok.completion || 0;
   return i + "→" + o;
+}
+function reasoningOf(tok) {
+  return tok ? (tok.reasoning || tok.reasoning_tokens || 0) : 0;
 }
 function ctxBadge(ctx) {
   if (!ctx || !ctx.level) return "";
@@ -84,10 +90,11 @@ function formatEntry(en) {
   const status = en.status != null ? en.status : "?";
   const ms = en.ms != null ? (en.ms / 1000).toFixed(1) + "s" : "";
   const tok = fmtTokens(en.tokens);
+  const re = reasoningOf(en.tokens);
   const chars = en.inChars != null || en.outChars != null ? en.inChars + "›" + (en.outChars || 0) + "ch" : "";
   const err = en.error ? " ERR:" + String(en.error).slice(0, 60) : "";
   const pth = en.path || "–";
-  return time + " " + model + " " + type + " " + status + " " + ms + " tok " + tok + " " + chars + " " + pth + err + (en.context && en.context.level ? " [CTX " + en.context.pct + "%]" : "");
+  return time + " " + model + " " + type + " " + status + " " + ms + " tok " + tok + (re > 0 ? " (R " + fmt(re) + ")" : "") + " " + chars + " " + pth + err + (en.context && en.context.level ? " [CTX " + en.context.pct + "%]" : "");
 }
 function renderLog(entries) {
   const log = $("streamlog");
@@ -113,6 +120,7 @@ function renderLog(entries) {
       ' · path=' + escHtml(last.path || "–") +
       ' · ' + escHtml(String(last.ms != null ? (last.ms / 1000).toFixed(1) + "s" : "–")) +
       ' · tokens <span class="t">in ' + escHtml(fmtTokens(tok)) + "</span>" +
+      (reasoningOf(tok) > 0 ? ' · <span class="t" title="reasoning tokens">R ' + escHtml(fmt(reasoningOf(tok))) + "</span>" : "") +
       ' · context <span class="t">' + escHtml((last.inChars || 0) + " chars in / " + (last.outChars || 0) + " out") + "</span>" +
       (ctx ? ' · <span class="' + (ctx.level === "critical" ? "e" : "t") + '">limit ' + escHtml(fmt(ctx.limit)) + " tok (" + ctx.pct + "%)" + (ctx.level ? " — " + escHtml(ctx.level) : "") + "</span>" : "") +
       (last.error ? ' · <span class="e">error: ' + escHtml(String(last.error).slice(0, 120)) + "</span>" : "");

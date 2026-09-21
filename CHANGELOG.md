@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-21g — Reasoning tokens in the dashboard + variant capture fix
+
+- **BUG: the variant was silently dropped** — modelName() strips -xhigh
+  before resolveZenModel could capture it, so xhigh requests ran at base
+  effort. Capture now happens before stripping (tested: reasoning_tokens 495
+  on an xhigh request, 0-ish on base).
+- Bridge logs real reasoning tokens per completion (was hardcoded 0 in one
+  path); usage exposes `reasoning_tokens` for clients.
+- Dashboard: totals.reasoningTok + per-model reasoningTok aggregates,
+  live-feed lines show `tok in→out (R N)`, last-detail card shows an
+  R badge, Reasoning Tokens card added to the usage panel.
+- Verified end-to-end: xhigh completion → bridge activity entry with
+  reasoning=656/295 → dashboard totals.reasoningTok climbing.
+
 ## 2026-09-21f — Real xhigh support for muse-spark models
 
 - The zen gateway REJECTS variant ids (`muse-spark-…-xhigh` → 401

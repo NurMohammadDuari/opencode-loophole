@@ -99,17 +99,19 @@ function ingest(e) {
   const inTok = tok ? (tok.input || tok.prompt || 0) : 0;
   const outTok = tok ? (tok.output || tok.completion || 0) : 0;
   const totTok = tok ? (tok.total || inTok + outTok) : 0;
+  const reTok = tok ? (tok.reasoning || tok.reasoning_tokens || 0) : 0;
   const inC = e.inChars || 0, outC = e.outChars || 0;
   const ms = e.ms || 0;
   totals.requests++;
   if (ok) totals.ok++; else totals.fail++;
   totals.inTok += inTok; totals.outTok += outTok; totals.totalTok += totTok;
+  totals.reasoningTok = (totals.reasoningTok || 0) + reTok;
   totals.inChars += inC; totals.outChars += outC; totals.msSum += ms;
   const m = normModel(e.resolved || e.model);
   let bm = byModel.get(m);
-  if (!bm) { bm = { model: m, count: 0, ok: 0, fail: 0, inTok: 0, outTok: 0, msSum: 0, lastTs: 0 }; byModel.set(m, bm); }
+  if (!bm) { bm = { model: m, count: 0, ok: 0, fail: 0, inTok: 0, outTok: 0, reasoningTok: 0, msSum: 0, lastTs: 0 }; byModel.set(m, bm); }
   bm.count++; if (ok) bm.ok++; else bm.fail++;
-  bm.inTok += inTok; bm.outTok += outTok; bm.msSum += ms;
+  bm.inTok += inTok; bm.outTok += outTok; bm.reasoningTok = (bm.reasoningTok || 0) + reTok; bm.msSum += ms;
   bm.lastTs = e.ts || bm.lastTs;
   const p = e.path || (e.error ? "error" : "unknown");
   byPath.set(p, (byPath.get(p) || 0) + 1);
@@ -150,6 +152,7 @@ function usageSnapshot() {
     totals: {
       requests: totals.requests, ok: totals.ok, fail: totals.fail,
       inTok: totals.inTok, outTok: totals.outTok, totalTok: totals.totalTok,
+      reasoningTok: totals.reasoningTok || 0,
       inChars: totals.inChars, outChars: totals.outChars,
       avgMs: totals.requests ? Math.round(totals.msSum / totals.requests) : 0,
       lastMinCount: lastMin ? lastMin.count : 0,

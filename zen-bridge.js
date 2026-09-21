@@ -167,13 +167,14 @@ function modelName(m) {
 }
 
 function resolveZenModel(m) {
+  // Capture the reasoning-effort variant BEFORE modelName() strips it.
+  // Variant ids (-xhigh/-high/…) are REJECTED by the zen gateway, but the
+  // effort is real: serve accepts a `variant` parameter. Base id goes to
+  // the gateway; variant goes to serve alongside the model.
+  const before = typeof m === "string" ? m.split("/").pop().replace(/^opencode:/, "") : "";
+  const vm = before.match(/-(xhigh|high|medium|low)$/i);
+  const variant = vm ? vm[1].toLowerCase() : null;
   const raw = modelName(m);
-  // Reasoning-effort variants (…-xhigh) are REJECTED by the zen gateway as
-  // model ids, but the effort itself is real: serve accepts a `variant`
-  // parameter. So split: base id goes to the gateway, variant goes to serve.
-  let variant = null;
-  const vm = raw.match(/-(xhigh|high|medium|low)$/i);
-  if (vm) { variant = vm[1].toLowerCase(); raw = raw.slice(0, raw.length - vm[1].length); }
   // Confirmed-live models always pass through as-is
   if (FAST_ZEN.has(raw) || raw === "big-pickle")
     return { requested: raw, zenModel: raw, remapped: false, variant };
@@ -694,7 +695,7 @@ async function zenResponsesOnce(model, chatBody, variant) {
   const tok = openaiRes.usage;
   return {
     tokens: tok
-      ? { input: tok.prompt_tokens || 0, output: tok.completion_tokens || 0, total: tok.total_tokens || 0, reasoning: 0, cache: { write: 0, read: 0 } }
+      ? { input: tok.prompt_tokens || 0, output: tok.completion_tokens || 0, total: tok.total_tokens || 0, reasoning: tok.reasoning_tokens || tok.reasoning || 0, cache: { write: 0, read: 0 } }
       : null,
     responsesObj: {
       id: respId, object: "response", created_at: created, model, status: "completed",
