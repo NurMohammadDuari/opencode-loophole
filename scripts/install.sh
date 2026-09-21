@@ -58,6 +58,7 @@ mkdir -p "$SERVEHOME/.local/share/opencode" "$SERVEHOME/.config/opencode" "$UNIT
 say "Deploying scripts and UI…"
 cp zen-bridge.js       "$SHARE/zen-bridge.js"
 cp zen-rotator.js      "$SHARE/zen-rotator.js"
+cp zen-proxy.js        "$SHARE/zen-proxy.js"
 cp config/models-catalog.json "$SHARE/models-catalog.json"
 cp config/models-catalog.json "$SERVEHOME/.local/share/opencode/models-catalog.json"
 cp config/serve-opencode.json "$SERVEHOME/.config/opencode/opencode.json"

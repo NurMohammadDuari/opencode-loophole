@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-21b — Real-CLI verification + missed Responses-path persona fix
+
+- **Persona leak survived in the real opencode CLI/app** even after the first
+  fix: the CLI uses the Responses streaming path, whose `prompt_async` call was
+  the one call site still missing `agent: "zen"`. Fixed; all three serve-prompt
+  call sites now drive the passthrough agent. Verified with the actual CLI:
+  "What is your name?" → "I don't have a name." (was "My name is Muse Spark.")
+- **Long output verified through the real CLI**: a 300-word request returned
+  489 streamed words (the old 15s stall-killer chopped answers at ~100 words).
+- Installer/update fixes: `zen-proxy.js` is now deployed (the unit runs it but
+  fresh installs never copied it), and `config/models-catalog.json` synced with
+  the live-corrected catalog so installs don't resurrect the stale model list.
+- Security sweep: no secrets tracked in git, no tokens in any committed file,
+  `auth.json` ignored (was previously tracked-but-ignored — confirmed absent
+  from the index).
+
 ## 2026-09-21 — Persona fix, model triage, truncation fix, zen-proxy repair
 
 - **"My name is Muse Spark." fixed** — the bridge now drives a custom

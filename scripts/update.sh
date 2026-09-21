@@ -23,6 +23,7 @@ SERVEHOME="$SHARE/servehome"
 mkdir -p "$SERVEHOME/.local/share/opencode" "$SERVEHOME/.config/opencode" "$SHARE/dashboard" "$SHARE/public" "$SHARE/token-history"
 cp zen-bridge.js       "$SHARE/zen-bridge.js"
 cp zen-rotator.js      "$SHARE/zen-rotator.js"
+cp zen-proxy.js        "$SHARE/zen-proxy.js"
 cp config/models-catalog.json "$SHARE/models-catalog.json"
 cp config/models-catalog.json "$SERVEHOME/.local/share/opencode/models-catalog.json"
 cp config/serve-opencode.json "$SERVEHOME/.config/opencode/opencode.json"
@@ -30,7 +31,7 @@ cp dashboard/dashboard-server.js "$SHARE/dashboard/"
 cp public/index.html public/style.css public/app.js "$SHARE/public/"
 
 say "Restarting services…"
-systemctl --user restart zen-rotator.service opencode-serve.service zen-bridge.service opencode-dashboard.service
+systemctl --user restart zen-rotator.service opencode-serve.service zen-bridge.service zen-proxy.service opencode-dashboard.service
 sleep 3
 
 if curl -sf --max-time 3 http://127.0.0.1:1343/health >/dev/null 2>&1; then

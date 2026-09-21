@@ -631,6 +631,7 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
 
       await new Promise((r) => setTimeout(r, 80));
       const prompt = await callServe("POST", `/session/${sessionID}/prompt_async`, {
+        agent: "zen",
         model: { providerID: "opencode", modelID: model },
         parts: buildParts(chatBody),
       }, 15000);
