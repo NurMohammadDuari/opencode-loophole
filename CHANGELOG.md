@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-21k — Visible thinking: stream reasoning to clients ("only thinking" fix)
+
+- Diagnosis: during long agent turns the model is NOT stuck — DB watch showed
+  steps advancing (reasoning → tool → reasoning). The app just shows an
+  opaque spinner because reasoning parts were hidden from the stream.
+- **Responses path**: reasoning deltas now stream as official
+  `response.reasoning_summary_text.delta` events (item added/done around
+  them), so clients can show live thinking. Answer text still never mixes
+  with reasoning.
+- **Chat SSE path**: reasoning mirrored as `delta.reasoning` chunks
+  (OpenAI-style; unknown fields are ignored by clients that don't use it).
+- Verified: reasoning visible from 6.7s, answer from 24.5s on the same turn;
+  chat path emits `delta.reasoning` chunks. Disable with ZEN_STREAM_REASONING=0.
+
 ## 2026-09-21j — App+CLI test round: official variant mechanism wired end-to-end
 
 - **CLI/app reject `-xhigh` model ids client-side** (`ProviderModelNotFoundError`)

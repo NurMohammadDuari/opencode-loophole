@@ -475,8 +475,14 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
     // partID, so we classify parts by type when they are announced.
     const reasoningPartIds = new Set();
     const textPartIds = new Set();
+    // Stream reasoning deltas as official Responses reasoning-summary events
+    // so clients show live "thinking" instead of an endless spinner.
+    // Disable with ZEN_STREAM_REASONING=0.
+    const streamReasoning = process.env.ZEN_STREAM_REASONING !== "0";
+    let reasoningStarted = false;
     const respId = "resp_" + crypto.randomBytes(12).toString("hex");
     const itemId = "item_" + crypto.randomBytes(8).toString("hex");
+    const reasoningItemId = itemId + "-r";
     const created = Math.floor(Date.now() / 1000);
 
     const safeWrite = (obj) => {
@@ -580,8 +586,16 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
         }
       }, 2000);
 
+      function emitReasoningDone() {
+        if (!reasoningStarted) return;
+        try {
+          safeWrite({ type: "response.reasoning_summary_text.done", item_id: reasoningItemId, output_index: 1, content_index: 0, text: "" });
+          safeWrite({ type: "response.output_item.done", output_index: 1, item: { type: "reasoning", id: reasoningItemId, summary: [], status: "completed" } });
+        } catch {}
+      }
+
       function emitResponsesText(text, pathTag) {
-        safeWrite({ type: "response.output_text.delta", item_id: itemId, output_index: 0, content_index: 0, delta: text });
+        emitReasoningDone();
         safeWrite({ type: "response.output_text.done", item_id: itemId, output_index: 0, content_index: 0, text });
         safeWrite({ type: "response.content_part.done", item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text, annotations: [] } });
         safeWrite({ type: "response.output_item.done", output_index: 0, item: { type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text, annotations: [] }], status: "completed" } });
@@ -623,6 +637,7 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
           return;
         }
         try {
+          emitReasoningDone();
           safeWrite({ type: "response.output_text.done", item_id: itemId, output_index: 0, content_index: 0, text: fullText });
           safeWrite({ type: "response.content_part.done", item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: fullText, annotations: [] } });
           safeWrite({ type: "response.output_item.done", output_index: 0, item: { type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text: fullText, annotations: [] }], status: "completed" } });
@@ -669,10 +684,21 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
           const delta = props.delta || "";
           if (!delta) return;
           if (!assistantMsgId && props.messageID) assistantMsgId = props.messageID;
-          // Reasoning parts are normal — but never leak into the answer stream.
+          // Reasoning parts stream as reasoning-summary events (visible
+          // thinking) — they never mix into the answer text.
           const isReasoning = pid ? reasoningPartIds.has(pid) : false;
           const isText = pid ? textPartIds.has(pid) : true; // unknown pid → assume text
-          if (isReasoning || !isText) return;
+          if (isReasoning) {
+            if (streamReasoning) {
+              if (!reasoningStarted) {
+                reasoningStarted = true;
+                safeWrite({ type: "response.output_item.added", output_index: 1, item: { type: "reasoning", id: reasoningItemId, summary: [], status: "in_progress" } });
+              }
+              safeWrite({ type: "response.reasoning_summary_text.delta", item_id: reasoningItemId, output_index: 1, content_index: 0, delta });
+            }
+            return;
+          }
+          if (!isText) return;
           fullText += delta;
           safeWrite({ type: "response.output_text.delta", item_id: itemId, output_index: 0, content_index: 0, delta });
         }
@@ -797,9 +823,12 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
     let tokens = null;
     let settled = false;
     let sub = null;
-    // Part-type tracking (see zenStreamResponsesToClient)
+    // Part-type tracking (see zenStreamResponsesToClient). Chat SSE clients
+    // ignore unknown delta types; reasoning is also mirrored into chat
+    // stream as `delta.reasoning` for clients that display it.
     const reasoningPartIds = new Set();
     const textPartIds = new Set();
+    let reasoningText = "";
     const chatId = "chatcmpl-" + crypto.randomBytes(8).toString("hex");
 
     const finish = (err) => {
@@ -960,7 +989,16 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
           if (!assistantMsgId && props.messageID) assistantMsgId = props.messageID;
           const isReasoning = pid ? reasoningPartIds.has(pid) : false;
           const isText = pid ? textPartIds.has(pid) : true;
-          if (isReasoning || !isText) return; // hide reasoning from the answer stream
+          if (isReasoning) {
+            // Visible thinking: mirror reasoning into delta.reasoning (OpenAI-
+            // compatible clients that don't know the field simply ignore it).
+            reasoningText += delta;
+            try {
+              res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { reasoning: delta }, finish_reason: null }] })}\n\n`);
+            } catch {}
+            return;
+          }
+          if (!isText) return;
           fullText += delta;
           try {
             res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] })}\n\n`);
