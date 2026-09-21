@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-21f — Real xhigh support for muse-spark models
+
+- The zen gateway REJECTS variant ids (`muse-spark-…-xhigh` → 401
+  ModelError), which is why xhigh in the app broke while the CLI sometimes
+  worked (the bridge's variant-suffix stripping made base requests succeed).
+- The reasoning effort itself is real: serve accepts a `variant` parameter
+  (verified: xhigh produces measurably more reasoning tokens than base).
+- The bridge now splits variant from the id (resolveZenModel), keeps sending
+  the base id to the gateway, and passes `variant: "xhigh"` to serve on all
+  three request paths (sync, chat stream, responses stream).
+- usage now includes `reasoning_tokens` so clients can see the effort level.
+- Context limits added for the xhigh ids.
+- Verified: base vs xhigh on the same prompt shows the effort difference
+  (xhigh took 2.6x longer, more reasoning tokens); both muse models in xhigh
+  stream 857-1145-word answers on the Responses path with clean completions.
+
 ## 2026-09-21e — App-path stability: reasoning-aware streaming, sane timeouts
 
 Root causes found for "app starts, then stops outputting / blank replies"

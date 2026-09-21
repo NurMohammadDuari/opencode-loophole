@@ -168,16 +168,22 @@ function modelName(m) {
 
 function resolveZenModel(m) {
   const raw = modelName(m);
+  // Reasoning-effort variants (…-xhigh) are REJECTED by the zen gateway as
+  // model ids, but the effort itself is real: serve accepts a `variant`
+  // parameter. So split: base id goes to the gateway, variant goes to serve.
+  let variant = null;
+  const vm = raw.match(/-(xhigh|high|medium|low)$/i);
+  if (vm) { variant = vm[1].toLowerCase(); raw = raw.slice(0, raw.length - vm[1].length); }
   // Confirmed-live models always pass through as-is
   if (FAST_ZEN.has(raw) || raw === "big-pickle")
-    return { requested: raw, zenModel: raw, remapped: false };
+    return { requested: raw, zenModel: raw, remapped: false, variant };
   // Explicit remap for non-live / flaky ids (including whitelist entries)
   if (MODEL_REMAP[raw])
-    return { requested: raw, zenModel: MODEL_REMAP[raw], remapped: true };
+    return { requested: raw, zenModel: MODEL_REMAP[raw], remapped: true, variant };
   // Whitelisted but not in remap — try exact id (recovery falls back to big-pickle)
   if (WHITELIST.includes(raw))
-    return { requested: raw, zenModel: raw, remapped: false };
-  return { requested: raw, zenModel: "big-pickle", remapped: true };
+    return { requested: raw, zenModel: raw, remapped: false, variant };
+  return { requested: raw, zenModel: "big-pickle", remapped: true, variant };
 }
 
 function messagesCharCount(messages) {
@@ -267,7 +273,7 @@ function extractAssistantText(messages) {
 }
 
 /** When stream idles with no text, retry with progressively smaller bodies + big-pickle. */
-async function recoverTextAfterEmpty(model, chatBody) {
+async function recoverTextAfterEmpty(model, chatBody, variant) {
   // big-pickle first: it is the fastest, most reliable model, and the original
   // model just stalled once already. Bodies go smallest-context first.
   const bodies = [
@@ -282,7 +288,7 @@ async function recoverTextAfterEmpty(model, chatBody) {
     const body = bodies[i % bodies.length];
     const mdl = models[Math.floor(i / bodies.length) % models.length];
     try {
-      const result = await zenOnce(mdl, body, RECOVERY_TIMEOUT_MS);
+      const result = await zenOnce(mdl, body, RECOVERY_TIMEOUT_MS, variant);
       const text = ((((result.openaiRes || {}).choices || [])[0] || {}).message || {}).content || "";
       if (text && String(text).trim()) {
         return {
@@ -439,7 +445,7 @@ function responsesBodyToChatBody(body) {
 }
 
 // ── Responses API SSE streaming ──────────────────────────────────────────────
-function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
+function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
   timeoutMs = timeoutMs || ZEN_TIMEOUT_MS;
   chatBody = compactChatBody(chatBody);
   return new Promise(async (resolve, reject) => {
@@ -664,11 +670,13 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
       });
 
       await new Promise((r) => setTimeout(r, 80));
-      const prompt = await callServe("POST", `/session/${sessionID}/prompt_async`, {
+      const promptBody = {
         agent: "zen",
         model: { providerID: "opencode", modelID: model },
         parts: buildParts(chatBody),
-      }, 15000);
+      };
+      if (variant) promptBody.variant = variant;
+      const prompt = await callServe("POST", `/session/${sessionID}/prompt_async`, promptBody, 15000);
       if (prompt.status !== 204 && prompt.status !== 200) {
         clearTimeout(timer); clearInterval(stallCheck);
         throw new Error("prompt_async failed: " + prompt.status + " " + (prompt.raw || "").slice(0, 200));
@@ -677,8 +685,8 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
   });
 }
 
-async function zenResponsesOnce(model, chatBody) {
-  const { openaiRes, sessionID, path: p } = await zenOnce(model, chatBody);
+async function zenResponsesOnce(model, chatBody, variant) {
+  const { openaiRes, sessionID, path: p } = await zenOnce(model, chatBody, null, variant);
   const text = (((openaiRes.choices || [])[0] || {}).message || {}).content || "";
   const created = Math.floor(Date.now() / 1000);
   const itemId = "item_" + crypto.randomBytes(8).toString("hex");
@@ -764,7 +772,7 @@ function buildParts(body) {
 }
 
 // ── Chat completions SSE streaming ───────────────────────────────────────────
-function zenStreamToClient(res, model, body, timeoutMs) {
+function zenStreamToClient(res, model, body, timeoutMs, variant) {
   timeoutMs = timeoutMs || ZEN_TIMEOUT_MS;
   body = compactChatBody(body);
   return new Promise(async (resolve, reject) => {
@@ -954,11 +962,13 @@ function zenStreamToClient(res, model, body, timeoutMs) {
       });
 
       await new Promise((r) => setTimeout(r, 80));
-      const prompt = await callServe("POST", `/session/${sessionID}/prompt_async`, {
+      const promptBody = {
         agent: "zen",
         model: { providerID: "opencode", modelID: model },
         parts: buildParts(body),
-      }, 15000);
+      };
+      if (variant) promptBody.variant = variant;
+      const prompt = await callServe("POST", `/session/${sessionID}/prompt_async`, promptBody, 15000);
       if (prompt.status !== 204 && prompt.status !== 200) {
         clearTimeout(timer); clearInterval(stallCheck);
         throw new Error("prompt_async failed: " + prompt.status + " " + (prompt.raw || "").slice(0, 200));
@@ -968,7 +978,7 @@ function zenStreamToClient(res, model, body, timeoutMs) {
 }
 
 // ── Non-stream: sync /message ─────────────────────────────────────────────────
-async function zenOnce(model, body, timeoutOverride) {
+async function zenOnce(model, body, timeoutOverride, variant) {
   const chatBody = compactChatBody(body);
   const timeoutMs = timeoutOverride || ZEN_TIMEOUT_MS;
   const session = await callServe("POST", "/session", { directory: null }, 15000);
@@ -976,11 +986,13 @@ async function zenOnce(model, body, timeoutOverride) {
     throw Object.assign(new Error("serve session failed: " + session.status), { status: session.status });
   const sessionID = session.json.id;
   try {
-    const msg = await callServe("POST", `/session/${sessionID}/message`, {
+    const msgBody = {
       agent: "zen",
       model: { providerID: "opencode", modelID: model },
       parts: buildParts(chatBody),
-    }, timeoutMs);
+    };
+    if (variant) msgBody.variant = variant; // reasoning-effort (e.g. xhigh)
+    const msg = await callServe("POST", `/session/${sessionID}/message`, msgBody, timeoutMs);
     if (msg.status !== 200)
       throw Object.assign(new Error("serve message failed: " + msg.status + " " + (msg.raw || "").slice(0, 200)), { status: msg.status });
     if (msg.json && msg.json.name === "UnknownError")
@@ -1005,7 +1017,7 @@ async function zenOnce(model, body, timeoutOverride) {
       object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
       choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
       usage: msg.json.info && msg.json.info.tokens
-        ? { prompt_tokens: msg.json.info.tokens.input || msg.json.info.tokens.prompt, completion_tokens: msg.json.info.tokens.output || msg.json.info.tokens.completion, total_tokens: msg.json.info.tokens.total }
+        ? { prompt_tokens: msg.json.info.tokens.input || msg.json.info.tokens.prompt, completion_tokens: msg.json.info.tokens.output || msg.json.info.tokens.completion, total_tokens: msg.json.info.tokens.total, reasoning_tokens: msg.json.info.tokens.reasoning || 0 }
         : undefined,
       system_fingerprint: sessionID,
     };
@@ -1031,10 +1043,10 @@ async function handleChat(res, body, stream) {
 
   const tryZen = async (model, tag, timeoutOverride) => {
     if (stream) {
-      const meta = await zenStreamToClient(res, model, body, timeoutOverride);
+      const meta = await zenStreamToClient(res, model, body, timeoutOverride, resolved.variant);
       return { path: meta.path || tag, model, requested, remapped: model !== requested, ...meta };
     }
-    const result = await zenOnce(model, body);
+    const result = await zenOnce(model, body, null, resolved.variant);
     const ctxHdr = contextWarning(requested, model, messagesCharCount(body && body.messages), (result.tokens && (result.tokens.input || result.tokens.prompt)) || 0);
     res.writeHead(200, {
       "Content-Type": "application/json",
@@ -1177,8 +1189,8 @@ const server = http.createServer((req, res) => {
 
       const doRequest = async () => {
         const tryZenResponses = async (mdl, timeoutOverride) => {
-          if (streamReq) return await zenStreamResponsesToClient(res, mdl, chatBody, timeoutOverride);
-          const result = await zenResponsesOnce(mdl, chatBody);
+          if (streamReq) return await zenStreamResponsesToClient(res, mdl, chatBody, timeoutOverride, resolved.variant);
+          const result = await zenResponsesOnce(mdl, chatBody, resolved.variant);
           res.writeHead(200, { "Content-Type": "application/json", ...proofHeaders({ "x-loophole-path": result.path, "x-loophole-model": mdl }) });
           res.end(JSON.stringify(result.responsesObj));
           return result;
