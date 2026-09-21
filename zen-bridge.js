@@ -1045,7 +1045,7 @@ async function handleChat(res, body, stream) {
   const tryZen = async (model, tag, timeoutOverride) => {
     if (stream) {
       const meta = await zenStreamToClient(res, model, body, timeoutOverride, resolved.variant);
-      return { path: meta.path || tag, model, requested, remapped: model !== requested, ...meta };
+      return { path: meta.path || tag, model, requested, variant: resolved.variant || null, remapped: model !== requested, ...meta };
     }
     const result = await zenOnce(model, body, null, resolved.variant);
     const ctxHdr = contextWarning(requested, model, messagesCharCount(body && body.messages), (result.tokens && (result.tokens.input || result.tokens.prompt)) || 0);
@@ -1057,7 +1057,7 @@ async function handleChat(res, body, stream) {
       }),
     });
     res.end(JSON.stringify(result.openaiRes));
-    return { path: tag, model, requested, remapped: model !== requested, tokens: result.tokens, inChars: result.inChars, outChars: result.outChars };
+    return { path: tag, model, requested, variant: resolved.variant || null, remapped: model !== requested, tokens: result.tokens, inChars: result.inChars, outChars: result.outChars };
   };
 
   try {
@@ -1158,7 +1158,7 @@ const server = http.createServer((req, res) => {
           const inC = messagesCharCount(body && body.messages);
           const toks = (meta && meta.tokens) || null;
           const usedTok = toks ? (toks.input || toks.prompt || 0) : 0;
-          logActivity({ event: "completion", model, resolved: meta && meta.model, path: meta && meta.path, stream: streamReq, status: 200, ms: Date.now() - t0, reqMs: t0 - started, inChars: inC, outChars: meta && meta.outChars != null ? meta.outChars : (meta && meta.text ? String(meta.text).length : 0), tokens: toks, context: contextWarning(model, (meta && meta.model) || model, inC, usedTok), real: true });
+          logActivity({ event: "completion", model, resolved: meta && meta.model, requested: meta && meta.requested, variant: (meta && meta.variant) || null, path: meta && meta.path, stream: streamReq, status: 200, ms: Date.now() - t0, reqMs: t0 - started, inChars: inC, outChars: meta && meta.outChars != null ? meta.outChars : (meta && meta.text ? String(meta.text).length : 0), tokens: toks, context: contextWarning(model, (meta && meta.model) || model, inC, usedTok), real: true });
         })
         .catch((e) => {
           const inC = messagesCharCount(body && body.messages);
@@ -1252,7 +1252,7 @@ const server = http.createServer((req, res) => {
           const inC = messagesCharCount(chatBody && chatBody.messages);
           const toks = (meta && meta.tokens) || null;
           const usedTok = toks ? (toks.input || 0) : 0;
-          logActivity({ event: "completion", api: "responses", model, resolved: meta && meta.model, path: meta && meta.path, stream: streamReq, status: 200, ms: Date.now() - t0, reqMs: t0 - started, inChars: inC, outChars: meta && meta.text ? String(meta.text).length : 0, tokens: toks, context: contextWarning(model, (meta && meta.model) || model, inC, usedTok), real: true });
+          logActivity({ event: "completion", api: "responses", model, resolved: meta && meta.model, requested: resolved.requested, variant: resolved.variant || null, path: meta && meta.path, stream: streamReq, status: 200, ms: Date.now() - t0, reqMs: t0 - started, inChars: inC, outChars: meta && meta.text ? String(meta.text).length : 0, tokens: toks, context: contextWarning(model, (meta && meta.model) || model, inC, usedTok), real: true });
         })
         .catch((e) => {
           const inC = messagesCharCount(chatBody && chatBody.messages);

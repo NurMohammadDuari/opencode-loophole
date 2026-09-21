@@ -24,6 +24,27 @@ function setConn(on) {
   if (dot) dot.className = "dot " + (on ? "on" : "off");
 }
 
+/* ── current model ── */
+function renderCurrentModel(usage) {
+  const el = $("current-model");
+  if (!el || !usage || !usage.currentModel) return;
+  const cm = usage.currentModel;
+  const parts = [];
+  if (cm.clientDefault) parts.push('client default: <span class="t">' + escHtml(cm.clientDefault) + "</span>");
+  const lr = cm.lastRequest;
+  if (lr) {
+    const age = lr.ts ? Math.max(0, Math.round((Date.now() - lr.ts) / 1000)) : null;
+    const eff = lr.variant ? ' <span class="ctx-badge warn">' + escHtml(lr.variant) + "</span>" : "";
+    let line = "last request: <b>" + escHtml(lr.requested) + eff + "</b>";
+    if (lr.remapped && lr.served && lr.served !== lr.requested)
+      line += " → served by <span class=\"t\">" + escHtml(lr.served) + "</span>";
+    if (age != null) line += ' <span class="dim">· " + (age < 60 ? age + "s ago" : Math.round(age / 60) + "m ago") + "</span>';
+    if (lr.reasoning > 0) line += ' <span class="t" title="reasoning tokens">R ' + escHtml(fmt(lr.reasoning)) + "</span>";
+    parts.push(line);
+  }
+  el.innerHTML = parts.length ? parts.join(" <span class=\"dim\">·</span> ") : '<span class="dim">no completions yet</span>';
+}
+
 /* ── usage cards ── */
 function renderUsage(usage) {
   if (!usage || !usage.totals) return;
@@ -49,6 +70,7 @@ function renderUsage(usage) {
   renderModelStats(usage.byModel || []);
   renderDaily(usage.daily || []);
   renderWarnings(usage);
+  renderCurrentModel(usage);
 }
 
 /* ── 30-min bar chart ── */
@@ -85,7 +107,10 @@ function ctxBadge(ctx) {
 }
 function formatEntry(en) {
   const time = new Date(en.ts).toLocaleTimeString();
-  const model = (en.resolved || en.model || "?").replace(/^opencode\//, "");
+  const req = (en.requested || en.model || "?").replace(/^opencode\//, "");
+  const served = (en.resolved || en.model || "?").replace(/^opencode\//, "");
+  const v = en.variant ? " <span class=\"ctx-badge warn\">" + escHtml(en.variant) + "</span>" : "";
+  const remap = served && req && served !== req ? " → <span class=\"t\">" + escHtml(served) + "</span>" : "";
   const type = en.api === "responses" ? "[RESP]" : en.stream ? "[SSE]" : "[JSON]";
   const status = en.status != null ? en.status : "?";
   const ms = en.ms != null ? (en.ms / 1000).toFixed(1) + "s" : "";
@@ -94,7 +119,7 @@ function formatEntry(en) {
   const chars = en.inChars != null || en.outChars != null ? en.inChars + "›" + (en.outChars || 0) + "ch" : "";
   const err = en.error ? " ERR:" + String(en.error).slice(0, 60) : "";
   const pth = en.path || "–";
-  return time + " " + model + " " + type + " " + status + " " + ms + " tok " + tok + (re > 0 ? " (R " + fmt(re) + ")" : "") + " " + chars + " " + pth + err + (en.context && en.context.level ? " [CTX " + en.context.pct + "%]" : "");
+  return time + " <b>" + escHtml(req) + v + remap + "</b> " + type + " " + status + " " + ms + " tok " + tok + (re > 0 ? " (R " + fmt(re) + ")" : "") + " " + chars + " " + pth + err + (en.context && en.context.level ? " [CTX " + en.context.pct + "%]" : "");
 }
 function renderLog(entries) {
   const log = $("streamlog");
@@ -105,7 +130,8 @@ function renderLog(entries) {
     const isErr = en.status !== 200 || !!en.error;
     const warn = en.context && en.context.level;
     const cls = isErr ? "e" : warn ? (en.context.level === "critical" ? "ctx-crit" : "ctx-warn") : "";
-    return cls ? '<span class="' + cls + '">' + escHtml(line) + "</span>" : escHtml(line);
+    if (cls) return '<span class="' + cls + '">' + line + "</span>";
+    return line;
   }).join("\n");
   log.innerHTML = html;
   log.scrollTop = log.scrollHeight;

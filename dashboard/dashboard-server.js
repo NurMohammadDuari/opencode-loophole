@@ -126,6 +126,38 @@ function ingest(e) {
   console.log("dashboard: replayed", ring.length, "activity entries");
 })();
 
+// What model is the user running? Reads the client default from the user's
+// opencode config and merges it with the latest completion actually served.
+function clientDefaultModel() {
+  for (const p of [
+    path.join(os.homedir(), ".config", "opencode", "opencode.json"),
+    path.join(SHARE, "servehome", ".config", "opencode", "opencode.json"),
+  ]) {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
+      if (cfg.model) return String(cfg.model).replace(/^opencode\//, "");
+    } catch {}
+  }
+  return null;
+}
+
+function currentModel() {
+  const last = ring.filter((e) => e.event === "completion").slice(-1)[0] || null;
+  return {
+    clientDefault: clientDefaultModel(),
+    lastRequest: last
+      ? {
+        requested: last.requested || normModel(last.model),
+        variant: last.variant || null,
+        served: normModel(last.resolved || last.model),
+        remapped: !!(last.requested && last.resolved && normModel(last.requested) !== normModel(last.resolved)),
+        ts: last.ts || null,
+        reasoning: last.tokens ? (last.tokens.reasoning || last.tokens.reasoning_tokens || 0) : 0,
+      }
+      : null,
+  };
+}
+
 function usageSnapshot() {
   const now = Date.now();
   const perMin = new Map();
@@ -165,6 +197,7 @@ function usageSnapshot() {
     byPath: Object.fromEntries([...byPath.entries()].sort((a, b) => b[1] - a[1])),
     lastEntries: ring.slice(-50).reverse(),
     warnings: ring.slice(-200).filter((e) => e.context && e.context.level).slice(-10).reverse(),
+    currentModel: currentModel(),
   };
 }
 

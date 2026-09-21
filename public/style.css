@@ -286,3 +286,12 @@ button:active, .btn:active {
 @media (max-width: 720px) {
   .log-wrap { grid-template-columns: 1fr; }
 }
+
+/* ── current model panel ── */
+.current-model-row {
+  font-size: 1.05em;
+  padding: 6px 2px;
+}
+.current-model-row b {
+  color: #e8e8e8;
+}
