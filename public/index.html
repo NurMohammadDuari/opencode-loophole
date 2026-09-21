@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>OpenCode Loophole Control Center</title>
-  <link rel="stylesheet" href="style.css?v=7" />
+  <link rel="stylesheet" href="style.css?v=8" />
 </head>
 <body>
   <div class="top-bar">
@@ -14,6 +14,16 @@
       <span id="clock" class="mini mono"></span>
     </div>
   </div>
+
+  <!-- ══ NOW USING — HERO ══ -->
+  <section class="panel now-using" id="now-using-panel">
+    <div class="nu-main">
+      <div class="nu-label">NOW USING — your client config <span class="dim mono" id="nu-src"></span></div>
+      <div class="nu-model mono"><b id="nu-client">–</b><span id="nu-variant"></span></div>
+      <div class="nu-detail mono" id="nu-detail">–</div>
+    </div>
+    <div class="nu-last mono" id="nu-last">no completions yet</div>
+  </section>
 
   <!-- ══ REALTIME USAGE CARDS ══ -->
   <section class="cards" id="usage-cards">
@@ -26,16 +36,16 @@
     <div class="card tok"><div class="k">Reasoning Tokens</div><div class="v" id="u-retok">0</div><div class="s" id="u-retok-s">thinking effort · xhigh/etc</div></div>
   </section>
 
-  <!-- ══ CURRENT MODEL ══ -->
-  <section class="panel current-model" id="current-model-panel">
-    <h2>Current Model <span class="dim">(what you are using right now)</span></h2>
-    <div id="current-model" class="current-model-row mono">–</div>
-  </section>
-
   <!-- ══ 30-MIN CHART ══ -->
   <section class="panel">
     <h2>Activity — last 30 min <span class="dim" id="chart-note">(requests/min, red = failures)</span></h2>
     <div id="chart" class="chart"></div>
+  </section>
+
+  <!-- ══ ERRORS & RECOVERY ══ -->
+  <section class="panel">
+    <h2>Errors &amp; Recovery <span class="dim">(last 12 failures — status, cause, which model took over)</span></h2>
+    <div id="err-list" class="stats-table mono">No errors. 🎉</div>
   </section>
 
   <!-- ══ CONTEXT WARNINGS ══ -->
@@ -43,7 +53,7 @@
 
   <!-- ══ LIVE STREAM ══ -->
   <section class="panel">
-    <h2>Live Completions <span class="dim">(realtime from bridge)</span></h2>
+    <h2>Live Completions <span class="dim">(realtime from bridge · requested → served · variant · R = reasoning tok)</span></h2>
     <div class="controls">
       <button class="btn" id="streamBtn" onclick="toggleStream()">■ Stop Stream</button>
       <span class="dim mono" id="stream-note">auto-reconnect every 3s</span>
@@ -85,10 +95,28 @@
     <div id="model-list" class="model-grid">Loading…</div>
   </section>
 
-  <!-- ══ MODEL LEADERBOARD ══ -->
+  <!-- ══ MODEL LEADERBOARD (served) ══ -->
   <section class="panel">
-    <h2>Usage by Model <span class="dim">(requests · tokens in/out · avg ms)</span></h2>
+    <h2>Usage by Served Model <span class="dim">(requests · tokens in/out · reasoning · avg ms)</span></h2>
     <div id="model-stats" class="stats-table">No data yet.</div>
+  </section>
+
+  <!-- ══ REQUESTED MODELS ══ -->
+  <section class="panel">
+    <h2>Usage by Requested Model <span class="dim">(what you picked in the app/CLI — incl. variant ids)</span></h2>
+    <div id="reqmodel-stats" class="stats-table">No data yet.</div>
+  </section>
+
+  <!-- ══ VARIANT STATS ══ -->
+  <section class="panel">
+    <h2>Usage by Variant <span class="dim">(base vs xhigh/high/… — reasoning effort comparison)</span></h2>
+    <div id="variant-stats" class="stats-table">No data yet.</div>
+  </section>
+
+  <!-- ══ API SPLIT ══ -->
+  <section class="panel">
+    <h2>API Split <span class="dim">(which code path served your requests)</span></h2>
+    <div id="path-split" class="stats-table">No data yet.</div>
   </section>
 
   <!-- ══ DAILY TOKEN HISTORY ══ -->
@@ -115,6 +143,6 @@
     <div id="proof-view" class="stats-table mono">–</div>
   </section>
 
-  <script src="app.js?v=7"></script>
+  <script src="app.js?v=8"></script>
 </body>
 </html>

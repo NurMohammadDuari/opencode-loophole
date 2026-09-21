@@ -24,25 +24,42 @@ function setConn(on) {
   if (dot) dot.className = "dot " + (on ? "on" : "off");
 }
 
-/* ── current model ── */
+/* ── now using (hero) ── */
+function variantOfModel(m) {
+  const match = String(m || "").match(/-(xhigh|high|medium|low)$/);
+  return match ? match[1] : null;
+}
 function renderCurrentModel(usage) {
-  const el = $("current-model");
-  if (!el || !usage || !usage.currentModel) return;
-  const cm = usage.currentModel;
-  const parts = [];
-  if (cm.clientDefault) parts.push('client default: <span class="t">' + escHtml(cm.clientDefault) + "</span>");
+  const cm = usage && usage.currentModel;
+  const client = $("nu-client"), vEl = $("nu-variant"), srcEl = $("nu-src"), detail = $("nu-detail"), last = $("nu-last");
+  if (!client || !cm) return;
+  if (cm.clientDefault) {
+    const v = variantOfModel(cm.clientDefault);
+    client.innerHTML = "<b>" + escHtml(cm.clientDefault) + "</b>";
+    vEl.innerHTML = v ? ' <span class="ctx-badge warn">' + escHtml(v) + "</span>" : "";
+    srcEl.textContent = "· from " + (cm.clientDefaultSrc || "config") + " config";
+  } else {
+    client.textContent = "unknown"; vEl.textContent = ""; srcEl.textContent = "· no model set in config";
+  }
   const lr = cm.lastRequest;
   if (lr) {
     const age = lr.ts ? Math.max(0, Math.round((Date.now() - lr.ts) / 1000)) : null;
     const eff = lr.variant ? ' <span class="ctx-badge warn">' + escHtml(lr.variant) + "</span>" : "";
-    let line = "last request: <b>" + escHtml(lr.requested) + eff + "</b>";
-    if (lr.remapped && lr.served && lr.served !== lr.requested)
-      line += " → served by <span class=\"t\">" + escHtml(lr.served) + "</span>";
-    if (age != null) line += ' <span class="dim">· " + (age < 60 ? age + "s ago" : Math.round(age / 60) + "m ago") + "</span>';
-    if (lr.reasoning > 0) line += ' <span class="t" title="reasoning tokens">R ' + escHtml(fmt(lr.reasoning)) + "</span>";
-    parts.push(line);
+    let line = "last completion: <b>" + escHtml(lr.requested) + eff + "</b>";
+    if (lr.remapped && lr.served && lr.served !== lr.requested) line += " → served by <span class=\"t\">" + escHtml(lr.served) + "</span>";
+    if (lr.status != null && lr.status !== 200) line += ' <span class="e">status ' + escHtml(lr.status) + "</span>";
+    if (lr.reasoning > 0) line += ' · <span class="t" title="reasoning tokens">R ' + escHtml(fmt(lr.reasoning)) + "</span>";
+    if (lr.ms != null) line += " · " + (lr.ms / 1000).toFixed(1) + "s";
+    if (age != null) line += ' <span class="dim">· ' + (age < 60 ? age + "s ago" : Math.round(age / 60) + "m ago") + "</span>";
+    last.innerHTML = line;
+    const t = lr.tokens || null;
+    detail.textContent = t
+      ? "in " + (t.input || 0) + " tok · out " + (t.output || 0) + " tok" + (lr.reasoning ? " · reasoning " + lr.reasoning : "") + (lr.context && lr.context.pct ? " · context " + lr.context.pct + "%" : "") + " · path " + (lr.path || "–")
+      : "path " + (lr.path || "–");
+  } else {
+    last.innerHTML = '<span class="dim">no completions from your tools yet</span>';
+    detail.textContent = "–";
   }
-  el.innerHTML = parts.length ? parts.join(" <span class=\"dim\">·</span> ") : '<span class="dim">no completions yet</span>';
 }
 
 /* ── usage cards ── */
@@ -71,6 +88,10 @@ function renderUsage(usage) {
   renderDaily(usage.daily || []);
   renderWarnings(usage);
   renderCurrentModel(usage);
+  renderErrors(usage.recentErrors || []);
+  renderVariantStats(usage.byVariant || []);
+  renderReqModelStats(usage.byReqModel || []);
+  renderPathSplit(usage.byPath || {});
 }
 
 /* ── 30-min bar chart ── */
@@ -119,7 +140,8 @@ function formatEntry(en) {
   const chars = en.inChars != null || en.outChars != null ? en.inChars + "›" + (en.outChars || 0) + "ch" : "";
   const err = en.error ? " ERR:" + String(en.error).slice(0, 60) : "";
   const pth = en.path || "–";
-  return time + " <b>" + escHtml(req) + v + remap + "</b> " + type + " " + status + " " + ms + " tok " + tok + (re > 0 ? " (R " + fmt(re) + ")" : "") + " " + chars + " " + pth + err + (en.context && en.context.level ? " [CTX " + en.context.pct + "%]" : "");
+  const probe = en.probe ? " [probe]" : "";
+  return time + " <b>" + escHtml(req) + v + remap + "</b> " + type + " " + status + " " + ms + " tok " + tok + (re > 0 ? " (R " + fmt(re) + ")" : "") + " " + chars + " " + pth + probe + err + (en.context && en.context.level ? " [CTX " + en.context.pct + "%]" : "");
 }
 function renderLog(entries) {
   const log = $("streamlog");
@@ -226,11 +248,65 @@ function renderModelStats(models) {
       + "<td>" + (m.fail ? "<span class='e'>" + m.fail + " (" + failPct + "%)</span>" : "0") + "</td>"
       + "<td class='t'>" + fmt(m.inTok) + "</td>"
       + "<td class='t'>" + fmt(m.outTok) + "</td>"
+      + "<td class='t'>" + fmt(m.reasoningTok || 0) + "</td>"
       + "<td>" + (avg / 1000).toFixed(1) + "s</td>"
       + "<td class='dim'>" + (m.lastTs ? new Date(m.lastTs).toLocaleTimeString() : "–") + "</td>"
       + "</tr>";
   }).join("");
-  box.innerHTML = "<table><thead><tr><th>model</th><th>req</th><th>fail</th><th>tok in</th><th>tok out</th><th>avg</th><th>last</th></tr></thead><tbody>" + rows + "</tbody></table>";
+  box.innerHTML = "<table><thead><tr><th>model</th><th>req</th><th>fail</th><th>tok in</th><th>tok out</th><th>R tok</th><th>avg</th><th>last</th></tr></thead><tbody>" + rows + "</tbody></table>";
+}
+
+/* ── errors & recovery ── */
+function renderErrors(errs) {
+  const box = $("err-list"); if (!box) return;
+  if (!errs.length) { box.innerHTML = "No errors. 🎉"; return; }
+  box.innerHTML = "<table><thead><tr><th>time</th><th>requested</th><th>variant</th><th>served</th><th>path</th><th>status</th><th>cause</th></tr></thead><tbody>"
+    + errs.map((e) => "<tr><td class='dim'>" + new Date(e.ts).toLocaleTimeString() + "</td>"
+      + "<td class='mono'>" + escHtml(e.requested) + "</td>"
+      + "<td>" + (e.variant ? "<span class='ctx-badge warn'>" + escHtml(e.variant) + "</span>" : "–") + "</td>"
+      + "<td class='mono'>" + escHtml(e.served) + "</td>"
+      + "<td class='dim'>" + escHtml(e.path || "–") + "</td>"
+      + "<td><span class='e'>" + escHtml(e.status) + "</span></td>"
+      + "<td class='e'>" + escHtml(String(e.error || "status " + e.status).slice(0, 80)) + "</td></tr>").join("")
+    + "</tbody></table>";
+}
+
+/* ── variant stats ── */
+function renderVariantStats(rows) {
+  const box = $("variant-stats"); if (!box) return;
+  if (!rows.length) { box.innerHTML = '<span class="dim">No data yet.</span>'; return; }
+  box.innerHTML = "<table><thead><tr><th>variant</th><th>req</th><th>ok</th><th>fail</th><th>reasoning tok</th><th>avg R/req</th><th>tok in</th><th>tok out</th><th>avg</th></tr></thead><tbody>"
+    + rows.map((r) => "<tr><td class='mono'>" + escHtml(r.key) + "</td>"
+      + "<td>" + r.count + "</td><td>" + r.ok + "</td><td>" + (r.fail ? "<span class='e'>" + r.fail + "</span>" : "0") + "</td>"
+      + "<td class='t'>" + fmt(r.reasoningTok) + "</td>"
+      + "<td class='t'>" + (r.count ? fmt(Math.round(r.reasoningTok / r.count)) : "–") + "</td>"
+      + "<td class='t'>" + fmt(r.inTok) + "</td><td class='t'>" + fmt(r.outTok) + "</td>"
+      + "<td>" + (r.count ? (r.msSum / r.count / 1000).toFixed(1) + "s" : "–") + "</td></tr>").join("")
+    + "</tbody></table>";
+}
+
+/* ── requested-model stats ── */
+function renderReqModelStats(rows) {
+  const box = $("reqmodel-stats"); if (!box) return;
+  if (!rows.length) { box.innerHTML = '<span class="dim">No data yet.</span>'; return; }
+  box.innerHTML = "<table><thead><tr><th>requested model</th><th>req</th><th>ok</th><th>fail</th><th>tok in</th><th>tok out</th><th>R tok</th><th>avg</th><th>last</th></tr></thead><tbody>"
+    + rows.slice(0, 14).map((r) => "<tr><td class='mono'>" + escHtml(r.key) + "</td>"
+      + "<td>" + r.count + "</td><td>" + r.ok + "</td><td>" + (r.fail ? "<span class='e'>" + r.fail + "</span>" : "0") + "</td>"
+      + "<td class='t'>" + fmt(r.inTok) + "</td><td class='t'>" + fmt(r.outTok) + "</td>"
+      + "<td class='t'>" + fmt(r.reasoningTok || 0) + "</td>"
+      + "<td>" + (r.count ? (r.msSum / r.count / 1000).toFixed(1) + "s" : "–") + "</td>"
+      + "<td class='dim'>" + (r.lastTs ? new Date(r.lastTs).toLocaleTimeString() : "–") + "</td></tr>").join("")
+    + "</tbody></table>";
+}
+
+/* ── api split ── */
+function renderPathSplit(byPath) {
+  const box = $("path-split"); if (!box) return;
+  const rows = Object.entries(byPath || {});
+  if (!rows.length) { box.innerHTML = '<span class="dim">No data yet.</span>'; return; }
+  box.innerHTML = "<table><thead><tr><th>api path</th><th>requests</th></tr></thead><tbody>"
+    + rows.map(([p, n]) => "<tr><td class='mono'>" + escHtml(p) + "</td><td>" + n + "</td></tr>").join("")
+    + "</tbody></table>";
 }
 
 /* ── SSE stream with auto-reconnect ── */

@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-21h — Extreme-detail dashboard: Now-Using hero, error forensics, variant/requested splits
+
+- **"Now Using" hero panel** — shows the model your client config actually
+  selects (with its source: cli vs app config) plus the last real completion
+  (requested → served, variant badge, R tokens, status, duration, age).
+  Diagnostic probes (Chain Test / curl / health checks) are excluded so the
+  panel reflects *your* usage, not test traffic.
+- **Errors & Recovery panel** — last 12 failures with requested/served model,
+  variant, api path, status and error cause, so failures are explainable at a
+  glance instead of hidden in a log wall.
+- **Usage by Requested Model** — what you picked (incl. -xhigh ids) vs the
+  existing served-model leaderboard; **Usage by Variant** — base vs xhigh with
+  reasoning tokens and avg R per request; **API Split** — which code path
+  (zen-responses / zen-stream / zen-live…) handled each request.
+- Model leaderboard and daily-history tables now include reasoning-token
+  columns; live-feed entries carry a [probe] tag for diagnostic traffic.
+- Investigated "using 1.3 but dashboard shows 1.2 / kept failing": real cause
+  was (a) diagnostic 1.2-xhigh probe traffic polluting the last-request panel
+  and (b) 2 bogus 500 entries from the fixed logging ReferenceError. Verified
+  live: muse-spark-1.3 & 1.3-xhigh serve correctly (R 1140 on xhigh).
+
 ## 2026-09-21g — Reasoning tokens in the dashboard + variant capture fix
 
 - **BUG: the variant was silently dropped** — modelName() strips -xhigh

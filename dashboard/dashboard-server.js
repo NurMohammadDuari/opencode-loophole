@@ -84,6 +84,18 @@ const ring = [];
 const totals = { requests: 0, ok: 0, fail: 0, inTok: 0, outTok: 0, totalTok: 0, inChars: 0, outChars: 0, msSum: 0 };
 const byModel = new Map(); // model -> {count, ok, fail, inTok, outTok, msSum, lastTs}
 const byPath = new Map();
+const byVariant = new Map(); // variant (base/xhigh/high/…) -> {count, ok, fail, reasoningTok, msSum}
+const byReqModel = new Map(); // what the CLIENT asked for (incl. variant ids) -> {count, ok, fail, reasoningTok, msSum}
+
+function bumpAgg(map, key, e, ok, inTok, outTok, reTok, ms) {
+  let b = map.get(key);
+  if (!b) { b = { key, count: 0, ok: 0, fail: 0, inTok: 0, outTok: 0, reasoningTok: 0, msSum: 0, lastTs: 0 }; map.set(key, b); }
+  b.count++; if (ok) b.ok++; else b.fail++;
+  b.inTok += inTok; b.outTok += outTok;
+  b.reasoningTok = (b.reasoningTok || 0) + reTok;
+  b.msSum += ms;
+  b.lastTs = e.ts || b.lastTs;
+}
 
 function normModel(m) {
   let s = String(m || "unknown").replace(/^opencode\//, "");
@@ -115,6 +127,9 @@ function ingest(e) {
   bm.lastTs = e.ts || bm.lastTs;
   const p = e.path || (e.error ? "error" : "unknown");
   byPath.set(p, (byPath.get(p) || 0) + 1);
+  // variant + requested-model aggregations
+  bumpAgg(byVariant, e.variant || "base", e, ok, inTok, outTok, reTok, ms);
+  bumpAgg(byReqModel, normModel(e.requested || e.model), e, ok, inTok, outTok, reTok, ms);
 }
 
 // Replay the recent log once at startup so totals survive dashboard restarts
@@ -126,36 +141,63 @@ function ingest(e) {
   console.log("dashboard: replayed", ring.length, "activity entries");
 })();
 
-// What model is the user running? Reads the client default from the user's
-// opencode config and merges it with the latest completion actually served.
+// What model is the user's client configured to use? Resolved per-source so the
+// dashboard can say "your CLI config says X, your app config says Y".
 function clientDefaultModel() {
-  for (const p of [
-    path.join(os.homedir(), ".config", "opencode", "opencode.json"),
-    path.join(SHARE, "servehome", ".config", "opencode", "opencode.json"),
-  ]) {
+  const sources = [
+    { src: "cli", p: path.join(os.homedir(), ".config", "opencode", "opencode.json") },
+    { src: "app/serve", p: path.join(SHARE, "servehome", ".config", "opencode", "opencode.json") },
+  ];
+  for (const s of sources) {
     try {
-      const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
-      if (cfg.model) return String(cfg.model).replace(/^opencode\//, "");
+      const cfg = JSON.parse(fs.readFileSync(s.p, "utf8"));
+      if (cfg.model) return { src: s.src, model: String(cfg.model).replace(/^opencode\//, "") };
     } catch {}
   }
   return null;
 }
 
+// Only completions the user's own tools actually triggered — diagnostic probes
+// (dashboard Chain Test, curl tests, health checks) are excluded so the
+// "current model" panel reflects YOUR usage, not test scripts.
+function isRealCompletion(e) {
+  if (e.event !== "completion" || !e.real) return false;
+  if (e.path && /chain-test|probe|health/i.test(e.path)) return false;
+  return true;
+}
+
 function currentModel() {
-  const last = ring.filter((e) => e.event === "completion").slice(-1)[0] || null;
+  const last = ring.filter(isRealCompletion).slice(-1)[0] || null;
+  const def = clientDefaultModel();
   return {
-    clientDefault: clientDefaultModel(),
+    clientDefault: def ? def.model : null,
+    clientDefaultSrc: def ? def.src : null,
     lastRequest: last
       ? {
         requested: last.requested || normModel(last.model),
         variant: last.variant || null,
         served: normModel(last.resolved || last.model),
         remapped: !!(last.requested && last.resolved && normModel(last.requested) !== normModel(last.resolved)),
+        path: last.path || null,
+        status: last.status,
+        ms: last.ms || null,
         ts: last.ts || null,
+        tokens: last.tokens || null,
         reasoning: last.tokens ? (last.tokens.reasoning || last.tokens.reasoning_tokens || 0) : 0,
+        context: last.context || null,
       }
       : null,
   };
+}
+
+function recentErrors() {
+  return ring.filter((e) => e.event === "completion" && (e.status !== 200 || e.error))
+    .slice(-12).reverse()
+    .map((e) => ({
+      ts: e.ts, requested: e.requested || normModel(e.model), variant: e.variant || null,
+      served: normModel(e.resolved || e.model), path: e.path || null, status: e.status,
+      error: e.error || null, ms: e.ms || null,
+    }));
 }
 
 function usageSnapshot() {
@@ -195,6 +237,9 @@ function usageSnapshot() {
     minutes,
     byModel: models,
     byPath: Object.fromEntries([...byPath.entries()].sort((a, b) => b[1] - a[1])),
+    byVariant: [...byVariant.values()].sort((a, b) => b.count - a.count),
+    byReqModel: [...byReqModel.values()].sort((a, b) => b.count - a.count),
+    recentErrors: recentErrors(),
     lastEntries: ring.slice(-50).reverse(),
     warnings: ring.slice(-200).filter((e) => e.context && e.context.level).slice(-10).reverse(),
     currentModel: currentModel(),
