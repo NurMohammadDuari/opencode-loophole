@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-21 — Persona fix, model triage, truncation fix, zen-proxy repair
+
+- **"My name is Muse Spark." fixed** — the bridge now drives a custom
+  passthrough `zen` agent (defined in the serve config) instead of OpenCode's
+  built-in default agent, whose system prompt branded every reply. Client
+  system prompts are honored again; a SYSTEM_TAG prefix plus an auto-injected
+  lock part protect bare requests with no system message.
+- **Only big-pickle / wrong-model output fixed** — live-tested all 31
+  whitelisted model ids as pass-through (detecting which model actually
+  serves): only 7 serve as themselves right now; dead ids now remap to
+  verified-live models (deepseek-v4 → muse-spark, jev → big-pickle, etc.) so
+  every model id returns a real answer in seconds instead of failing over.
+- **Truncation fixed** ("stops at ~100 words") — mid-stream silence killer
+  raised from a hardcoded 15s to STREAM_STALL_MS=45s (tunable); reasoning
+  models that pause 30-60s mid-answer no longer get chopped. Verified with a
+  926-word streamed answer ending in a clean finish_reason=stop.
+- **zen-proxy crash-loop fixed** — removed a duplicated `function forward(`
+  declaration (SyntaxError) introduced by a local edit; unit runs again.
+- Catalog correctly deployed to the bridge's real load path inside servehome
+  (previous deploys were silently ignored); serve restart required for new
+  agent config to load.
+
 ## 2026-09-20f — One-command installer
 
 - `scripts/install.sh`: single-command install — detects node/opencode (incl.

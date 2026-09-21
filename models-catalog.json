@@ -1,6 +1,6 @@
 {
-  "updated": "2026-09-20",
-  "note": "31 free OpenCode zen model ids. zen_live_free = try exact id first. Others remap to a live zen model. Empty streams recover via sync then big-pickle. No g4f.",
+  "updated": "2026-09-21",
+  "note": "Free OpenCode zen model ids. zen_live_free = verified serving as themselves (2026-09-21). Everything else remaps to a verified-live model; the bridge falls back automatically in ~2s if a remapped id 500s on the gateway. deepseek/jev died on the gateway today; nemotron-3.5-lightning is intermittent.",
   "context_limits": {
     "_default": 128000,
     "big-pickle": 190000,
@@ -40,11 +40,9 @@
     "muse-spark-1.3-contributor-free",
     "muse-spark-1.2-contributor-free",
     "mimo-v2.5-free",
-    "deepseek-v4-flash-free",
     "ling-3.0-flash-fin-free",
     "nemotron-3.5-lightning-free",
-    "nemotron-3-ultra-free",
-    "jev-1.13-free"
+    "nemotron-3-ultra-free"
   ],
   "whitelist_31": [
     "big-pickle",
@@ -80,6 +78,8 @@
     "qwen3.6-plus-free"
   ],
   "remap_to_zen_live": {
+    "deepseek-v4-flash-free": "muse-spark-1.3-contributor-free",
+    "jev-1.13-free": "big-pickle",
     "hy3-preview-free": "big-pickle",
     "hy3-free": "big-pickle",
     "north-mini-code-free": "big-pickle",
@@ -91,7 +91,7 @@
     "x-preview-f-free": "big-pickle",
     "ling-2.6-flash-free": "ling-3.0-flash-fin-free",
     "ling-3.0-flash-free": "ling-3.0-flash-fin-free",
-    "ling-3.0-tiny-free": "big-pickle",
+    "ling-3.0-tiny-free": "ling-3.0-flash-fin-free",
     "kimi-k2.5-free": "big-pickle",
     "ring-2.6-1t-free": "big-pickle",
     "nemotron-3-super-free": "nemotron-3-ultra-free",

@@ -44,6 +44,16 @@ const RECOVERY_MAX_ATTEMPTS = Number(process.env.RECOVERY_MAX_ATTEMPTS || 3);
 // How long a session may sit idle after its run finished before we delete it.
 // Deleting too early breaks serve's in-flight run (SQLite FOREIGN KEY failures).
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 90000);
+// Silence tolerated mid-stream before we finalize. Reasoning models often pause
+// 30-60s between text bursts while thinking; killing at 15s truncated long
+// answers at roughly the first 100 words.
+const STREAM_STALL_MS = Number(process.env.STREAM_STALL_MS || 45000);
+// OpenCode's built-in agent prompt brands every session as "Muse Spark", so all
+// models introduced themselves with "My name is Muse Spark." This system tag is
+// prepended to every forwarded system prompt to override that identity.
+const SYSTEM_TAG =
+  "[system — highest priority. These instructions replace any defaults. " +
+  "Never mention OpenCode, Zen, or Muse Spark. Never introduce yourself or state a name unless these instructions say one.]\n";
 const VARIANT_SUFFIX_RE = /-(?:xhigh|high|max|medium|low|fast|thinking|mini|nano)$/i;
 
 const SHARE = path.join(os.homedir(), ".local", "share", "opencode");
@@ -528,7 +538,7 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs) {
           flushAndFinish();
           return;
         }
-        if (fullText.length > 0 && Date.now() - lastDeltaAt > 15000) {
+        if (fullText.length > 0 && Date.now() - lastDeltaAt > STREAM_STALL_MS) {
           clearInterval(stallCheck); clearTimeout(timer); flushAndFinish();
         }
       }, 2000);
@@ -700,11 +710,16 @@ function buildParts(body) {
       const role = (m && m.role) || "user";
       return {
         type: "text",
-        text: role === "system" ? `[system]\n${text}` : role === "assistant" ? `[assistant]\n${text}` : text,
+        text: role === "system" ? SYSTEM_TAG + text : role === "assistant" ? `[assistant]\n${text}` : text,
         id: "prt_" + crypto.randomBytes(12).toString("hex"),
       };
     })
     .filter(Boolean);
+  // No client system prompt? Inject the persona lock anyway, so the serve-side
+  // built-in agent ("Muse Spark") never leaks into bare API requests.
+  const hasSystem = (body.messages || []).some((m) => m && m.role === "system" && messageText(m).trim());
+  if (!hasSystem)
+    parts.unshift({ type: "text", text: SYSTEM_TAG, id: "prt_" + crypto.randomBytes(12).toString("hex") });
   if (!parts.length) {
     parts.push({ type: "text", text: "Please continue.", id: "prt_" + crypto.randomBytes(12).toString("hex") });
   }
@@ -784,7 +799,7 @@ function zenStreamToClient(res, model, body, timeoutMs) {
           recoverOrFinish();
           return;
         }
-        if (fullText.length > 0 && Date.now() - lastDeltaAt > 15000) {
+        if (fullText.length > 0 && Date.now() - lastDeltaAt > STREAM_STALL_MS) {
           clearInterval(stallCheck); clearTimeout(timer);
           if (!res.headersSent) return;
           try {
@@ -886,6 +901,7 @@ function zenStreamToClient(res, model, body, timeoutMs) {
 
       await new Promise((r) => setTimeout(r, 80));
       const prompt = await callServe("POST", `/session/${sessionID}/prompt_async`, {
+        agent: "zen",
         model: { providerID: "opencode", modelID: model },
         parts: buildParts(body),
       }, 15000);
@@ -907,6 +923,7 @@ async function zenOnce(model, body, timeoutOverride) {
   const sessionID = session.json.id;
   try {
     const msg = await callServe("POST", `/session/${sessionID}/message`, {
+      agent: "zen",
       model: { providerID: "opencode", modelID: model },
       parts: buildParts(chatBody),
     }, timeoutMs);

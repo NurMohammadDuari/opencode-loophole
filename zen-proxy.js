@@ -55,7 +55,6 @@ function attempts() {
 }
 
 function forward(req, res, path, body, auth) {
-function forward(req, res, path, body, auth) {
   // Strip leading '/v1' if present to avoid double /v1 in upstream URL
   if (path.startsWith('/v1')) {
     path = path.slice(3);
