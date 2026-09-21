@@ -173,6 +173,8 @@ const SERVICES = [
     desc: "Real OpenCode client session (passes the zen Console gate)" },
   { name: "rotator", label: "Zen Rotator", port: 1341, unit: "zen-rotator.service", healthUrl: "",
     desc: "Rotates x-real-ip per request = fresh per-IP daily bucket" },
+  { name: "proxy", label: "Zen Proxy", port: 1338, unit: "zen-proxy.service", healthUrl: "",
+    desc: "Optional pacing proxy for direct token use (bypasses burst limits)" },
   { name: "dashboard", label: "Dashboard", port: 1395, unit: "opencode-dashboard.service", healthUrl: "",
     desc: "This control center" },
 ];
@@ -298,12 +300,29 @@ const DB_CANDIDATES = [
 ];
 
 // ── Token history: daily JSONL files written by the bridge ───────────────────
-const HISTORY_DIR = process.env.TOKEN_HISTORY_DIR || path.join(SHARE, "token-history");
+// The bridge runs with HOME=servehome, so it writes history INSIDE the serve
+// home; the dashboard historically looked at SHARE/token-history (empty).
+// Resolve dynamically: first candidate dir that actually has tokens-*.jsonl.
+const HISTORY_DIRS = [
+  process.env.TOKEN_HISTORY_DIR,
+  path.join(SERVEHOME_SHARE, "token-history"),
+  path.join(SHARE, "token-history"),
+].filter(Boolean);
 const DAILY_DAYS = 7;
 
+function historyDir() {
+  for (const dir of HISTORY_DIRS) {
+    try {
+      if (fs.readdirSync(dir).some((f) => /^tokens-\d{4}-\d{2}-\d{2}\.jsonl$/.test(f))) return dir;
+    } catch {}
+  }
+  return HISTORY_DIRS[HISTORY_DIRS.length - 1];
+}
+
 function listHistoryFiles(days = DAILY_DAYS) {
+  const dir = historyDir();
   try {
-    return fs.readdirSync(HISTORY_DIR)
+    return fs.readdirSync(dir)
       .filter((f) => /^tokens-\d{4}-\d{2}-\d{2}\.jsonl$/.test(f))
       .sort()
       .slice(-days);
@@ -316,7 +335,7 @@ function dailyUsage() {
     const day = f.replace(/^tokens-/, "").replace(/\.jsonl$/, "");
     const agg = { day, requests: 0, ok: 0, fail: 0, inTok: 0, outTok: 0, totalTok: 0, inChars: 0, outChars: 0, msSum: 0, warnings: 0 };
     try {
-      const raw = fs.readFileSync(path.join(HISTORY_DIR, f), "utf8");
+      const raw = fs.readFileSync(path.join(historyDir(), f), "utf8");
       for (const line of raw.split(/\r?\n/)) {
         if (!line) continue;
         let e; try { e = JSON.parse(line); } catch { continue; }

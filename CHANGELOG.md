@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-21c — Dashboard reflects the new fixes
+
+- **Token History panel was empty**: the dashboard read
+  `~/.local/share/opencode/token-history/` (created empty by the installer)
+  while the bridge — running with HOME=servehome — writes the daily JSONL
+  files inside the serve home. History dirs are now resolved dynamically
+  (first dir that actually contains tokens-*.jsonl wins); today's row shows
+  requests/ok/tokens/warnings again.
+- **zen-proxy added to the services panel** (5th unit) with port, systemd
+  state and controls; restart-all and per-service actions cover it too.
+- Verified end-to-end: /api/status lists all 5 units running, /api/usage
+  daily shows 2026-09-20 + 2026-09-21 with token totals, chain test returns
+  ok:true with a real completion, SSE stream pushes live usage payload.
+
 ## 2026-09-21b — Real-CLI verification + missed Responses-path persona fix
 
 - **Persona leak survived in the real opencode CLI/app** even after the first
