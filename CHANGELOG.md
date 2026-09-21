@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-21i — THE 3-MINUTE KILLER: systemd unit forced ZEN_TIMEOUT_MS=180000
+
+- **Root cause of "slow output then stops at ~3 min"**: the deployed
+  `zen-bridge.service` carried `Environment=ZEN_TIMEOUT_MS=180000`, silently
+  overriding the code's 900s default. Every long agent turn died at exactly
+  180.0s (log proof: 180042/180025/180016ms, zero tokens counted because the
+  kill raced the stream flush).
+- Unit now sets `ZEN_TIMEOUT_MS=900000` and `STREAM_STALL_MS=300000` — the
+  90s stall window previously finalized streams during silent tool runs
+  (bash builds, scans) that produce no events for minutes.
+- Live-verified: PID environment shows 900000/300000; streamed 1.3 turn:
+  first token 5.9s, 479 words, clean finish.
+- Lesson recorded: code defaults don't win over unit `Environment=` — both
+  places are now kept in sync.
+
 ## 2026-09-21h — Extreme-detail dashboard: Now-Using hero, error forensics, variant/requested splits
 
 - **"Now Using" hero panel** — shows the model your client config actually

@@ -14,7 +14,12 @@ Environment=SERVE_USER=opencode
 Environment=SERVE_PASS=opencodepass
 Environment=HOME=/home/mint/.local/share/opencode/servehome
 Environment=FAST_RACE=0
-Environment=ZEN_TIMEOUT_MS=180000
+# 900s: heavy agent turns (reasoning + tools) legitimately run many minutes;
+# a 180s cap here killed long turns at exactly 3 min (blank/partial output)
+Environment=ZEN_TIMEOUT_MS=900000
+# 300s: silent tool runs (bash builds, scans) produce no events for minutes;
+# a 90s stall window cut agent turns that were still working
+Environment=STREAM_STALL_MS=300000
 Environment=EMPTY_STREAM_GRACE_MS=90000
 Environment=RECOVERY_TIMEOUT_MS=45000
 Environment=RECOVERY_MAX_ATTEMPTS=3
