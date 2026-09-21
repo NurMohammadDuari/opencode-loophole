@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-21j — App+CLI test round: official variant mechanism wired end-to-end
+
+- **CLI/app reject `-xhigh` model ids client-side** (`ProviderModelNotFoundError`)
+  — confirmed by real `opencode run` tests; that suffix approach only worked
+  via raw API calls. The official OpenCode mechanism is **model variants**.
+- Client config now declares `variants` (xhigh/high/medium/low →
+  reasoningEffort) for both muse-spark models; they appear in the TUI/app
+  model picker under the base ids.
+- **Bridge accepts the official wire format**: `reasoning_effort` (or
+  `reasoning.effort`) in the request body now maps to serve's `variant`
+  parameter on both /v1/chat/completions and /v1/responses paths. Verified:
+  body effort=xhigh → variant logged, R 156 on a tiny prompt.
+- CLI verified: persona OK ("My name is OpenCode."), 612/613/388-token
+  streamed answers, 280-word history answer, TCP/UDP 250 words — all 200 via
+  the bridge with reasoning tokens recorded.
+
 ## 2026-09-21i — THE 3-MINUTE KILLER: systemd unit forced ZEN_TIMEOUT_MS=180000
 
 - **Root cause of "slow output then stops at ~3 min"**: the deployed

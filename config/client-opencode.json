@@ -50,6 +50,40 @@
       ],
       "options": {
         "baseURL": "http://127.0.0.1:1343/v1"
+      },
+      "models": {
+        "muse-spark-1.3-contributor-free": {
+          "variants": {
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            }
+          }
+        },
+        "muse-spark-1.2-contributor-free": {
+          "variants": {
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "low": {
+              "reasoningEffort": "low"
+            }
+          }
+        }
       }
     }
   },

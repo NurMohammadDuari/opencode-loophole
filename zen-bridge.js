@@ -191,6 +191,19 @@ function messagesCharCount(messages) {
   return (messages || []).reduce((n, m) => n + messageText(m).length, 0);
 }
 
+// Official OpenCode variants send the effort in the request body
+// (reasoning_effort / reasoning.effort) rather than a -xhigh model suffix.
+// Map that to serve's `variant` parameter so effort is actually applied.
+function variantFromBody(body) {
+  if (!body || typeof body !== "object") return null;
+  let v = body.reasoning_effort;
+  if (!v && body.reasoning && typeof body.reasoning === "object") v = body.reasoning.effort;
+  if (typeof v !== "string") return null;
+  v = v.toLowerCase();
+  if (v === "minimal") v = "low";
+  return ["low", "medium", "high", "xhigh"].includes(v) ? v : null;
+}
+
 /** Keep last turns under MAX_PROMPT_CHARS so zen/desktop agent history does not overflow. */
 function compactChatBody(body, budget) {
   budget = budget || MAX_PROMPT_CHARS;
@@ -1036,6 +1049,7 @@ async function zenOnce(model, body, timeoutOverride, variant) {
 async function handleChat(res, body, stream) {
   body = compactChatBody(body);
   const resolved = resolveZenModel(body.model);
+  if (!resolved.variant) resolved.variant = variantFromBody(body);
   const requested = resolved.requested;
   let zenModel = resolved.zenModel;
   let remapped = resolved.remapped;
@@ -1186,6 +1200,7 @@ const server = http.createServer((req, res) => {
       const t0 = Date.now();
 
       const resolved = resolveZenModel(model);
+      if (!resolved.variant) resolved.variant = variantFromBody(rawBody);
       const zenModel = FAST_ZEN.has(resolved.requested) ? resolved.requested : resolved.zenModel;
 
       const doRequest = async () => {
