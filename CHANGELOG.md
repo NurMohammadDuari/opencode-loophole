@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-22 — Development visibility: tool narration + agent protocol
+
+- **No more black box.** Every tool call the hidden serve agent makes is
+  narrated into the client conversation *while it runs*: commands
+  (`⚙ bash: …`), file edits with path and diff preview
+  (`✎ edit src/app.js (+12 −3)` + changed lines), completions with output
+  (`✔ … → result`), failures with the error (`✖ …`).
+- New shared `narrateToolPart()` helper in `zen-bridge.js` (module scope,
+  used by both the Responses and chat stream paths): rich per-tool detail,
+  160-char clipping, and **de-duplication** of serve's repeated status
+  events (previously the same `⚙` line was sent 3×).
+- **Layer 2 — agent protocol**: the `zen` agent prompt in the serve config
+  now embeds the condensed visibility rules: INSPECT → PLAN → EDIT →
+  SHOW RESULT → TEST → REPORT, `FILE:`/`MODIFIED:` markers with diffs,
+  command results with exit codes, progress markers on long tasks, and
+  "never claim fixed/passed without running the check — write UNVERIFIED".
+- Documented as the project contract in `docs/11-visibility.md`.
+
 ## 2026-09-21k — Visible thinking: stream reasoning to clients ("only thinking" fix)
 
 - Diagnosis: during long agent turns the model is NOT stuck — DB watch showed

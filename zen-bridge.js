@@ -158,6 +158,55 @@ function readRotatorTail(n = 5) {
   } catch { return []; }
 }
 
+// ── Tool narration (development visibility) ─────────────────────────────
+// Turns a serve "tool" part into ONE visible line for the client's reasoning
+// stream: the agent's current action (command, file path, edit diff preview,
+// output) so the development process is never a black box. Reasoning channel
+// only — never mixes into answer text. `seen` de-dupes serve's repeated
+// status events for the same tool call (running fires many times).
+function narrateToolPart(part, seen) {
+  const st = (part && part.state) || {};
+  const tool = (part && part.tool) || "tool";
+  const inp = st.input || {};
+  const status = st.status || "";
+  const clip = (s, n) => String(s == null ? "" : s).replace(/\s+/g, " ").trim().slice(0, n || 160);
+  const nLines = (s) => (s == null || s === "" ? 0 : String(s).split("\n").length);
+
+  let detail = "";
+  let startSym = "⚙";
+  if (tool === "bash") detail = clip(inp.command, 140);
+  else if (tool === "edit" || tool === "patch" || tool === "write") {
+    startSym = "✎";
+    const fp = clip(inp.filePath || inp.path || "file", 90);
+    if (tool === "write") detail = fp + (inp.content != null ? " (" + nLines(inp.content) + " lines)" : "");
+    else detail = fp + " (+" + nLines(inp.newString != null ? inp.newString : inp.new) + " −" + nLines(inp.oldString != null ? inp.oldString : inp.old) + ")";
+  } else if (tool === "read") detail = clip(inp.filePath || inp.path, 90);
+  else if (tool === "grep" || tool === "glob") detail = clip(inp.pattern, 60) + (inp.path ? " in " + clip(inp.path, 50) : "");
+  else detail = clip(inp.description || (typeof inp === "object" && inp !== null ? "" : String(inp)));
+
+  const key = (part && part.id ? part.id : tool) + ":" + status + ":" + detail;
+  if (seen.has(key)) return null;
+  if (seen.size > 400) seen.clear();
+  seen.add(key);
+
+  if (status === "running") return startSym + " " + tool + (detail ? ": " + detail : "…");
+  if (status === "completed") {
+    const out = clip((st.metadata && st.metadata.output) || st.output, 120);
+    let line = "✔ " + tool + (detail ? " " + detail : " done") + (out ? " → " + out : "");
+    // Edits: append a 3-line preview of what actually changed (the diff).
+    if (tool === "edit" || tool === "patch") {
+      const nw = String((inp.newString != null ? inp.newString : inp.new) || "").split("\n").filter((l) => l.trim()).slice(0, 3);
+      if (nw.length) line += "\n    " + nw.map((l) => "│ " + clip(l, 100)).join("\n    ");
+    }
+    return line;
+  }
+  if (status === "error") {
+    const err = clip((st.metadata && (st.metadata.error || st.metadata.output)) || st.error, 120);
+    return "✖ " + tool + " failed" + (detail ? " " + detail : "") + (err ? " → " + err : "");
+  }
+  return null;
+}
+
 function modelName(m) {
   if (typeof m !== "string") return "big-pickle";
   let raw = m.split("/").pop().replace(/^opencode:/, "");
@@ -475,6 +524,7 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
     // partID, so we classify parts by type when they are announced.
     const reasoningPartIds = new Set();
     const textPartIds = new Set();
+    const narratedKeys = new Set();
     // Stream reasoning deltas as official Responses reasoning-summary events
     // so clients show live "thinking" instead of an endless spinner.
     // Disable with ZEN_STREAM_REASONING=0.
@@ -676,6 +726,20 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
             if (part.type === "reasoning") { reasoningPartIds.add(part.id); textPartIds.delete(part.id); }
             else if (part.type === "text") { textPartIds.add(part.id); reasoningPartIds.delete(part.id); }
           }
+          // Narrate tool activity into the reasoning channel so clients see
+          // WHAT the agent is doing (commands, file edits, diffs, reads)
+          // instead of a silent spinner. Reasoning channel only — never the
+          // answer text. Disable with ZEN_STREAM_REASONING=0.
+          if (part.type === "tool" && streamReasoning) {
+            const line = narrateToolPart(part, narratedKeys);
+            if (line) {
+              if (!reasoningStarted) {
+                reasoningStarted = true;
+                safeWrite({ type: "response.output_item.added", output_index: 1, item: { type: "reasoning", id: reasoningItemId, summary: [], status: "in_progress" } });
+              }
+              safeWrite({ type: "response.reasoning_summary_text.delta", item_id: reasoningItemId, output_index: 1, content_index: 0, delta: "\n" + line + "\n" });
+            }
+          }
         }
 
         if (type === "message.part.delta") {
@@ -828,6 +892,7 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
     // stream as `delta.reasoning` for clients that display it.
     const reasoningPartIds = new Set();
     const textPartIds = new Set();
+    const narratedKeys = new Set();
     let reasoningText = "";
     const chatId = "chatcmpl-" + crypto.randomBytes(8).toString("hex");
 
@@ -971,13 +1036,22 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
         if (type === "message.updated") {
           const info = props.info || {};
           if (info.role === "assistant" && info.id) { assistantMsgId = info.id; if (info.tokens) tokens = info.tokens; }
-        }
-
-        if (type === "message.part.updated" || type === "message.part-updated") {
+        }        if (type === "message.part.updated" || type === "message.part-updated") {
           const part = props.part || {};
           if (part && part.id) {
             if (part.type === "reasoning") { reasoningPartIds.add(part.id); textPartIds.delete(part.id); }
             else if (part.type === "text") { textPartIds.add(part.id); reasoningPartIds.delete(part.id); }
+          }
+          // Narrate tool activity into delta.reasoning so chat clients see
+          // what the agent is doing (commands, edits, diffs) live.
+          if (part.type === "tool") {
+            const line = narrateToolPart(part, narratedKeys);
+            if (line) {
+              reasoningText += line + "\n";
+              try {
+                res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { reasoning: "\n" + line + "\n" }, finish_reason: null }] })}\n\n`);
+              } catch {}
+            }
           }
         }
 
@@ -987,6 +1061,7 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
           const delta = props.delta || "";
           if (!delta) return;
           if (!assistantMsgId && props.messageID) assistantMsgId = props.messageID;
+
           const isReasoning = pid ? reasoningPartIds.has(pid) : false;
           const isText = pid ? textPartIds.has(pid) : true;
           if (isReasoning) {
