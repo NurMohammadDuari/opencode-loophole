@@ -38,8 +38,40 @@
         "doom_loop": "allow",
         "skill": "allow"
       }
+    },
+    "build": {
+      "permission": {
+        "read": "allow", "edit": "allow", "glob": "allow", "grep": "allow", "list": "allow",
+        "bash": "allow", "task": "allow", "external_directory": "allow", "todowrite": "allow",
+        "question": "allow", "webfetch": "allow", "websearch": "allow", "lsp": "allow",
+        "doom_loop": "allow", "skill": "allow"
+      }
+    },
+    "general": {
+      "permission": {
+        "read": "allow", "edit": "allow", "glob": "allow", "grep": "allow", "list": "allow",
+        "bash": "allow", "task": "allow", "external_directory": "allow", "todowrite": "allow",
+        "question": "allow", "webfetch": "allow", "websearch": "allow", "lsp": "allow",
+        "doom_loop": "allow", "skill": "allow"
+      }
+    },
+    "explore": {
+      "permission": {
+        "read": "allow", "edit": "allow", "glob": "allow", "grep": "allow", "list": "allow",
+        "bash": "allow", "task": "allow", "external_directory": "allow", "todowrite": "allow",
+        "question": "allow", "webfetch": "allow", "websearch": "allow", "lsp": "allow",
+        "doom_loop": "allow", "skill": "allow"
+      }
     }
   },
+  "attachment": {
+    "image": { "auto_resize": false }
+  },
+  "tool_output": {
+    "max_lines": 100000,
+    "max_bytes": 1048576
+  },
+  "subagent_depth": 4,
   "enabled_providers": [
     "opencode"
   ],

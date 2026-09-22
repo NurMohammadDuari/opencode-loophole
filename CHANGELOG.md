@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-22 (7) — No-restriction round 3: every agent unlocked, every input limit lifted
+
+- **All built-in agents now carry explicit allow-all permission
+  overrides** (`plan`, `build`, `general`, `explore` — the binaries
+  contain per-agent deny patterns; only `plan` was overridden in
+  round 2). Applied to repo client/serve/root + both live client
+  copies; serve config synced (`.bak-20260922-234256`).
+- **Input limits lifted** in all five configs:
+  - `attachment.image.auto_resize: false` — images sent as-is (were
+    auto-downscaled to 2000px / 5 MB)
+  - `tool_output: 100000 lines / 1 MB` (was 2000 lines / 50 KB) —
+    agents see full command output instead of truncated previews
+  - `subagent_depth: 4` (was 1) — subagents may spawn subagents
+- **Bridge prompt budget raised 28000 → 48000**
+  (`MAX_PROMPT_CHARS` in `zen-bridge.service`, unit backed up;
+  confirmed in the running process env alongside
+  `MAX_SYSTEM_CHARS=20000`).
+- App restarted in a verified-quiet window (fresh run `1b3f48f5`) so
+  the client config loads; 5/5 services active.
+- **Live compliance test after restart**: created
+  `/tmp/compliance-proof3.txt` (`ROUND3`), answered `DONE` in 9.0s.
+
 ## 2026-09-22 (6) — No-restriction round 2: Plan-agent unlock + big-instruction cap raised
 
 - **Plan agent could still refuse edits**: OpenCode's built-in `plan`
