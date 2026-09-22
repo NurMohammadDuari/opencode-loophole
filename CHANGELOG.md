@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-22 (2) — One-command deploy + housekeeping
+
+- **`scripts/deploy.sh`** — syncs every shipped file from the repo to the
+  live runtime (`~/.local/share/opencode`) *and* `~/.opencode`, timestamp-
+  backing-up any destination that differs, syntax-checking the JS, restarting
+  **only the services whose files changed**, waiting for the bridge, then
+  running `./test.sh`. Flags: `--no-restart`, `--no-test`.
+- `.gitignore`: ignore `.freebuff/` agent metadata.
+- `origin` remote points straight at `github.com` — pushes no longer pass
+  through the gh-proxy third party, so credentials never leave this machine.
+- Deployed live fixes: stale runtime `zen-bridge.js` (running copy) and stale
+  runtime `public/` frontend (new dashboard server was serving the old UI).
+
 ## 2026-09-22 — Development visibility: tool narration + agent protocol
 
 - **No more black box.** Every tool call the hidden serve agent makes is

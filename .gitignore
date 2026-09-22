@@ -15,3 +15,4 @@ opencode.db-*
 storage/
 log/
 __pycache__/
+.freebuff/
