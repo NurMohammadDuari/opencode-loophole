@@ -33,7 +33,7 @@ sync() { # sync <src> <dst> [service]
     mkdir -p "$(dirname "$dst")"
     cp "$src" "$dst"
     echo "updated $dst"
-    [ -n "$svc" ] && note_svc "$svc"
+    if [ -n "$svc" ]; then note_svc "$svc"; fi
   else
     echo "same    $dst"
   fi

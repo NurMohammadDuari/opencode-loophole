@@ -81,6 +81,8 @@ function readActivity(limit = 300) {
 // ── Usage aggregation (in-memory ring + startup replay) ──────────────────────
 const RING_MAX = 2000;
 const ring = [];
+const NARR_MAX = 300;
+const narrRing = []; // narration lines only (event:"narration") — the live agent-activity feed
 const totals = { requests: 0, ok: 0, fail: 0, inTok: 0, outTok: 0, totalTok: 0, inChars: 0, outChars: 0, msSum: 0 };
 const byModel = new Map(); // model -> {count, ok, fail, inTok, outTok, msSum, lastTs}
 const byPath = new Map();
@@ -104,6 +106,13 @@ function normModel(m) {
 
 function ingest(e) {
   if (!e || typeof e !== "object") return;
+  if (e.event === "narration") {
+    // Keep tool narration OUT of the completion ring (would evict stats and
+    // break the Live Completions renderer) — own bounded ring instead.
+    narrRing.push(e);
+    if (narrRing.length > NARR_MAX) narrRing.shift();
+    return;
+  }
   ring.push(e);
   if (ring.length > RING_MAX) ring.shift();
   const ok = e.status === 200;
@@ -241,6 +250,7 @@ function usageSnapshot() {
     byReqModel: [...byReqModel.values()].sort((a, b) => b.count - a.count),
     recentErrors: recentErrors(),
     lastEntries: ring.slice(-50).reverse(),
+    narration: narrRing.slice(-40),
     warnings: ring.slice(-200).filter((e) => e.context && e.context.level).slice(-10).reverse(),
     currentModel: currentModel(),
   };
@@ -546,7 +556,7 @@ setInterval(async () => {
     lastStatus = s;
     const payload = {
       ts: Date.now(),
-      entries: fresh,
+      entries: fresh.filter((e) => e.event !== "narration"),
       usage: usageSnapshot(),
       status: s,
     };

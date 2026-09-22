@@ -92,6 +92,7 @@ function renderUsage(usage) {
   renderVariantStats(usage.byVariant || []);
   renderReqModelStats(usage.byReqModel || []);
   renderPathSplit(usage.byPath || {});
+  renderNarration(usage);
 }
 
 /* ── 30-min bar chart ── */
@@ -307,6 +308,19 @@ function renderPathSplit(byPath) {
   box.innerHTML = "<table><thead><tr><th>api path</th><th>requests</th></tr></thead><tbody>"
     + rows.map(([p, n]) => "<tr><td class='mono'>" + escHtml(p) + "</td><td>" + n + "</td></tr>").join("")
     + "</tbody></table>";
+}
+
+/* ── live agent activity (narrated tool work, newest on top) ── */
+function renderNarration(usage) {
+  const el = $("activity-log");
+  if (!el) return;
+  const items = (usage && usage.narration) || [];
+  if (!items.length) { el.innerHTML = '<span class="dim">Waiting for tool activity…</span>'; return; }
+  el.innerHTML = items.slice().reverse().map((n) => {
+    const t = new Date(n.ts).toLocaleTimeString();
+    return '<div class="narr-line"><span class="dim">' + escHtml(t) + "</span> "
+      + escHtml(String(n.line || "")).replace(/\n/g, "<br>&nbsp;&nbsp;&nbsp;&nbsp;") + "</div>";
+  }).join("");
 }
 
 /* ── SSE stream with auto-reconnect ── */

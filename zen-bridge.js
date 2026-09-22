@@ -189,8 +189,9 @@ function narrateToolPart(part, seen) {
   if (seen.size > 400) seen.clear();
   seen.add(key);
 
-  if (status === "running") return startSym + " " + tool + (detail ? ": " + detail : "…");
-  if (status === "completed") {
+  let result = null;
+  if (status === "running") result = startSym + " " + tool + (detail ? ": " + detail : "…");
+  else if (status === "completed") {
     const out = clip((st.metadata && st.metadata.output) || st.output, 120);
     let line = "✔ " + tool + (detail ? " " + detail : " done") + (out ? " → " + out : "");
     // Edits: append a 3-line preview of what actually changed (the diff).
@@ -198,13 +199,18 @@ function narrateToolPart(part, seen) {
       const nw = String((inp.newString != null ? inp.newString : inp.new) || "").split("\n").filter((l) => l.trim()).slice(0, 3);
       if (nw.length) line += "\n    " + nw.map((l) => "│ " + clip(l, 100)).join("\n    ");
     }
-    return line;
-  }
-  if (status === "error") {
+    result = line;
+  } else if (status === "error") {
     const err = clip((st.metadata && (st.metadata.error || st.metadata.output)) || st.error, 120);
-    return "✖ " + tool + " failed" + (detail ? " " + detail : "") + (err ? " → " + err : "");
+    result = "✖ " + tool + " failed" + (detail ? " " + detail : "") + (err ? " → " + err : "");
   }
-  return null;
+  // Mirror every narrated line into the activity log so the dashboard's
+  // "Live Agent Activity" panel shows the work as it happens — even when
+  // the client GUI renders nothing.
+  if (result != null) {
+    try { logActivity({ event: "narration", tool, status, line: result }); } catch {}
+  }
+  return result;
 }
 
 function modelName(m) {

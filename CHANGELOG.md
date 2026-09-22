@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-22 (3) — Live Agent Activity: watch the work happen
+
+- **Deep analysis of "OpenCode works in the background, nothing shows":**
+  - Tool work executes *inside* serve (server-side agent) — the client UI
+    can never show native edit/read chips; the reasoning channel is the
+    only client-facing projection of the work.
+  - Client parser verified in the actual binaries (CLI 1.18.31, app
+    2.7.62): chat streams read `delta.reasoning_content ?? delta.reasoning`
+    — the bridge's `delta.reasoning` narration IS accepted.
+  - `opencode run` hides thinking unless `--thinking` is passed, and turns
+    serialize behind the shared serve session (huge bloated sessions make
+    this worse) — so a stalled turn shows zero feedback.
+- **Bridge**: every narrated tool line is now mirrored into
+  `bridge-activity.jsonl` as `event:"narration"` (tool, status, line).
+- **Dashboard**: new **Live Agent Activity** panel — last 40 narrated lines
+  (ring of 300), pushed over the existing 2s SSE usage payload; narration
+  events are kept out of the completion ring so stats/streams stay correct.
+- Frontend cache bumped to `?v=9`.
+
 ## 2026-09-22 (2) — One-command deploy + housekeeping
 
 - **`scripts/deploy.sh`** — syncs every shipped file from the repo to the

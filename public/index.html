@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>OpenCode Loophole Control Center</title>
-  <link rel="stylesheet" href="style.css?v=8" />
+  <link rel="stylesheet" href="style.css?v=9" />
 </head>
 <body>
   <div class="top-bar">
@@ -62,6 +62,12 @@
       <div id="streamlog" class="log">Waiting for completions…</div>
       <div id="last-detail" class="last-detail mono"></div>
     </div>
+  </section>
+
+  <!-- ══ LIVE AGENT ACTIVITY ══ -->
+  <section class="panel">
+    <h2>Live Agent Activity <span class="dim">(the serve agent's real work, narrated while it runs — commands, file edits with diff previews, results)</span></h2>
+    <div id="activity-log" class="log mono">Waiting for tool activity…</div>
   </section>
 
   <!-- ══ SERVICES ══ -->
@@ -143,6 +149,6 @@
     <div id="proof-view" class="stats-table mono">–</div>
   </section>
 
-  <script src="app.js?v=8"></script>
+  <script src="app.js?v=9"></script>
 </body>
 </html>

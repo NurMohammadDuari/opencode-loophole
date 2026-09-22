@@ -66,8 +66,12 @@ protocol:
 1. Live thinking streams before the answer (reasoning channel).
 2. Tool activity lines with file paths, commands and diff previews.
 3. The model's own step-by-step narration following the protocol.
-4. The dashboard (`:1395`) adds per-completion tokens, reasoning tokens,
-   requested→served models and an Errors & Recovery panel.
+4. The dashboard (`:1395`) adds a **Live Agent Activity** panel — every
+   narrated tool line (commands, edits, diff previews, results) as it
+   happens, pushed over the same 2s SSE as the usage numbers — plus
+   per-completion tokens, reasoning tokens, requested→served models and
+   an Errors & Recovery panel. Works even when a client GUI renders
+   nothing.
 
 ## Honest scope notes
 
@@ -75,6 +79,8 @@ protocol:
   `⚙` / `✔` lines present and deduped). Whether a given client GUI
   *renders* reasoning parts is the client's choice — OpenCode renders
   reasoning parts for reasoning-capable models, which is this channel.
-- The dashboard shows per-completion telemetry, not per-tool events.
+- The dashboard shows per-tool events live (`event:"narration"` entries in
+  `bridge-activity.jsonl`, ring of 300, last 40 in the payload) alongside
+  per-completion telemetry.
 - Tool events originate from the hidden serve session; narration is a
   faithful projection of those events, not a re-execution.
