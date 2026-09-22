@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-22 (6) — No-restriction round 2: Plan-agent unlock + big-instruction cap raised
+
+- **Plan agent could still refuse edits**: OpenCode's built-in `plan`
+  agent ships `permission: { edit: "deny" }` (verified in both
+  binaries). Added an explicit `agent.plan` override with all 15 tools
+  `"allow"` to every config (repo client/serve/root + both live client
+  copies) — switching to Plan mode no longer blocks edits or bash.
+- **Bridge instruction cap raised 6000 → 20000**
+  (`MAX_SYSTEM_CHARS` in the `zen-bridge.service` unit, backed up
+  first): huge pasted instruction blocks keep their tail instead of
+  being silently truncated. Confirmed in the running process env.
+- Live serve config re-synced (`.bak-20260922-233749`) and
+  `opencode-serve` + `zen-bridge` restarted to load both changes.
+- **Post-restart compliance test**: model created
+  `/tmp/compliance-proof2.txt` (content `ENABLED`) and answered `DONE`
+  in 9.7s — action-on-request still verified after the restart.
+- deploy `exit 0`, `./test.sh` `exit 0`.
+
 ## 2026-09-22 (5) — Final xhigh kill + no-restriction config ("follow any request")
 
 - **The last two xhigh stores found and purged** (the earlier UI-state
