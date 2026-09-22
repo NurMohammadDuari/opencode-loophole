@@ -54,33 +54,33 @@
       "models": {
         "muse-spark-1.3-contributor-free": {
           "variants": {
-            "xhigh": {
-              "reasoningEffort": "xhigh"
-            },
-            "high": {
-              "reasoningEffort": "high"
+            "low": {
+              "reasoningEffort": "low"
             },
             "medium": {
               "reasoningEffort": "medium"
             },
-            "low": {
-              "reasoningEffort": "low"
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
             }
           }
         },
         "muse-spark-1.2-contributor-free": {
           "variants": {
-            "xhigh": {
-              "reasoningEffort": "xhigh"
-            },
-            "high": {
-              "reasoningEffort": "high"
+            "low": {
+              "reasoningEffort": "low"
             },
             "medium": {
               "reasoningEffort": "medium"
             },
-            "low": {
-              "reasoningEffort": "low"
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
             }
           }
         }

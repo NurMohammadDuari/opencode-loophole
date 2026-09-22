@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-22 (4) — Fix "app only thinks, never answers": remove the xhigh default
+
+- **Root cause (evidence, not guesswork):** every desktop-app turn was
+  running `variant:"xhigh"` — measured tonight at 60s / 125s / 398s /
+  576s to first output, while the CLI (base variant) answered in
+  seconds. The xhigh pin lived in two places:
+  1. `session.model` in `opencode.db` — **155 sessions** stored
+     `{"id":"muse-spark-…","variant":"xhigh"}` (both active sessions
+     included), inherited by every new session;
+  2. the client config's `variants` maps listed **`xhigh` first** —
+     the auto-picked default entry.
+  The bridge never injected it (`variantFromBody` only passes what the
+  client sends), and localStorage held no variant state — verified by
+  binary greps of the app bundle and state dirs.
+- **Config** (`~/.config/opencode/opencode.json` +
+  `config/client-opencode.json`): variant order is now
+  `low → medium → high → xhigh` (fast default; xhigh still one click
+  away). JSON validated after edit.
+- **Database**: flipped `"variant":"xhigh"` → `"variant":"default"` on
+  all 155 session rows **after both in-flight turns drained** (waited
+  for completions 439→441 to avoid WAL contention mid-stream).
+  Pre-edit values dumped to `session-model-flip-backup.json` (repo:
+  `~/.local/share/opencode/`) for exact rollback. Verified: 0 xhigh
+  rows left, hot sessions now `default`, 174 muse-spark default
+  sessions.
+- **Requires one app restart** (or reopening the session) — the running
+  app caches session model state in memory.
+
 ## 2026-09-22 (3) — Live Agent Activity: watch the work happen
 
 - **Deep analysis of "OpenCode works in the background, nothing shows":**
