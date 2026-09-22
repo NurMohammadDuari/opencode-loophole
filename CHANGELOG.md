@@ -29,6 +29,23 @@ All notable changes to this project will be documented in this file.
   sessions.
 - **Requires one app restart** (or reopening the session) — the running
   app caches session model state in memory.
+- **Round 2 — the real persistent source was the chat history itself:**
+  5,818 `message.data` rows stamped `"variant":"xhigh"` (assistant
+  `variant` field + user `model.variant`). The app re-seeds each
+  session's selection from its last message, which is why session-table
+  flips kept getting overwritten on load (observed re-dirtying at
+  22:17:01 and 22:17:20). Flipped all 5,818 → `"default"` (backup:
+  `message-variant-flip-backup.json`, 2.9 MB) and re-flipped the 2
+  session rows (`session-model-flip-backup2.json`). The 4 remaining
+  `xhigh` matches are legacy `modelID:"…-xhigh"` suffix strings in cold
+  /tmp sessions — harmless, the bridge strips suffixes.
+- **Verified after final restart**: fresh boot (run=e19cfa64, 16:27:14Z)
+  loaded the config, window restored, and — the decisive check — both
+  hot sessions STILL `variant:"default"` post-load with 0 xhigh rows
+  anywhere.
+- Operational note: never `pkill -f` a pattern that appears in your own
+  command line — it signals the shell running the command (cost two
+  restart attempts here).
 
 ## 2026-09-22 (3) — Live Agent Activity: watch the work happen
 
