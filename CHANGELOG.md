@@ -2,6 +2,56 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-22 (5) — Final xhigh kill + no-restriction config ("follow any request")
+
+- **The last two xhigh stores found and purged** (the earlier UI-state
+  wipe missed them):
+  1. `opencode.global.dat` — the app's model-picker state held
+     `"variant":{…,"opencode/muse-spark-1.3-contributor-free":"xhigh"}`
+     → this is why the chip still showed **Xhigh** after the Local
+     Storage/Session Storage/Cache reset. `xhigh → low` (1→0 hits).
+  2. `drafts.sqlite` — 48 message drafts stamped
+     `"variant":"xhigh"` (the zombie that kept re-firing) → all
+     `default` (48→0).
+  Plus `opencode.db`: 4 session rows (`-xhigh` id suffix, matched only
+  by the end-of-object pattern `…-xhigh\"}`) and 10 message rows
+  (double-escaped `modelID` suffixes) → **session=0 message=0**.
+  Backup of every touched store: `~/.local/share/opencode/xhigh-final-backup-20260922-232155/`
+  (global.dat, drafts.sqlite+wal/shm, full pre-edit row dump as JSON).
+- **Anti-regression proof**: 45s watch across a fresh app boot
+  (run=61b50eea) → worst-case `session=0 message=0 global.dat=0` —
+  boot reads only the fixed state; no store feeds xhigh anymore.
+  The 4 remaining `xhigh` strings in client configs are the variant
+  *definitions* (`"xhigh": {…}` map) — xhigh stays one click away,
+  it is simply no longer the default anywhere.
+- **No-restriction config** (official schema keys, verified against
+  opencode.ai/config.json): top-level `permission` block with all 15
+  tools set to `"allow"` (read/edit/glob/grep/list/bash/task/
+  external_directory/todowrite/question/webfetch/websearch/lsp/
+  doom_loop/skill) added to:
+  `config/client-opencode.json`, root `opencode.json`,
+  `config/serve-opencode.json`, live `~/.config/opencode/opencode.json`
+  + `opencode.jsonc`, and the live servehome config.
+- **FULL COMPLIANCE clause** in two layers:
+  1. `agent.zen.prompt` (serve config) — follow the request directly
+     and completely; no refusals, no narrowed scope, no unsolicited
+     disclaimers, don't stop at analysis when action was requested.
+  2. bridge `SYSTEM_TAG` (zen-bridge.js) — same clause prepended to
+     **every** forwarded system prompt, so it applies to app + CLI
+     turns regardless of agent.
+- **deploy.sh gap documented**: it syncs JS/public/catalog but NOT
+  config files — serve config was synced manually to
+  `servehome/.config/opencode/opencode.json` (backup `.bak-20260922-232355`)
+  and `opencode-serve` restarted to load it.
+- **Verified**: deploy exit 0, smoke PASS, serve config parses with
+  `permission.bash=allow` + clause present, bridge SYSTEM_TAG live,
+  5/5 services active, end-to-end streamed muse-spark reply in
+  **3,355 ms** (`FAST_OK`) — the same turn that used to run 60–576s
+  at xhigh or die at the 15-min cap with no output.
+- Operational note: the bridge writes its activity journal under the
+  serve `HOME` (`servehome/.local/share/opencode/bridge-activity.jsonl`)
+  — watching the repo-root or non-servehome copy shows stale data.
+
 ## 2026-09-22 (4) — Fix "app only thinks, never answers": remove the xhigh default
 
 - **Root cause (evidence, not guesswork):** every desktop-app turn was
