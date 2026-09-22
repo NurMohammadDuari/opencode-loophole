@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-09-23a — Bridge self-recovery: "zen: no response" now heals instead of apologizing
+
+- **Recovery-before-defeat (zen-bridge.js)** — the two no-text error branches (Responses API + chat SSE) previously emitted `[zen: no response — model may be unavailable, try big-pickle…]` *without ever running the recovery their own message suggested*. Both branches now call `recoverTextAfterEmpty()` (progressively smaller prompts + big-pickle fallback, bounded 3×45s) before emitting anything. Failure text now carries the real upstream cause instead of a generic apology. Paths `zen-responses-recovered` / `zen-stream-recovered` visible in the dashboard when healing succeeds.
+- **`MAX_PROMPT_CHARS` 48000 → 100000 (zen-bridge.service)** — a 75,603-char RE prompt tonight was silently truncated at 48k before reaching the model; new cap takes the full context.
+- Evidence: 00:07:30 turn (in=75,603, out=0) + 00:09:55 turn (in=16,431, out=0) — both pre-fix silent upstream deaths; live e2e post-deploy: streamed 200 in 9.0s with a real file-creation action executed.
+- Backups: `zen-bridge.js.bak-20260923-003156`, `zen-bridge.service.bak-20260923-003156`.
+- Note: the two 19:19 `requested is not defined` 500s came from the pre-restart bridge generation; that bug does not exist in current code (verified by grep).
+
 ## 2026-09-22 (7) — No-restriction round 3: every agent unlocked, every input limit lifted
 
 - **All built-in agents now carry explicit allow-all permission

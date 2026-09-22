@@ -558,17 +558,33 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
       if (err) {
         if (res.headersSent) {
           if (fullText === "") {
-            // Blank output: close stream with error event instead of empty text
-            try {
-              safeWrite({ type: "response.output_text.delta", item_id: itemId, output_index: 0, content_index: 0, delta: "[zen: no response — model may be unavailable, try big-pickle or muse-spark-1.3-contributor-free]" });
-              safeWrite({ type: "response.output_text.done", item_id: itemId, output_index: 0, content_index: 0, text: "[zen: no response]" });
-              safeWrite({ type: "response.content_part.done", item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: "[zen: no response]", annotations: [] } });
-              safeWrite({ type: "response.output_item.done", output_index: 0, item: { type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text: "[zen: no response]", annotations: [] }], status: "completed" } });
-              safeWrite({ type: "response.completed", response: buildResponseObj(respId, model, created, "[zen: no response]", tokens, "completed") });
-              res.write("data: [DONE]\n\n");
-              res.end();
-            } catch {}
-            resolve({ sessionID, text: "", tokens, ms: Date.now() - t0, path: "zen-responses-notext", streamErr: err.message });
+            // Blank output: run last-chance recovery (smaller prompts + big-pickle)
+            // BEFORE giving up — the old code emitted "[zen: no response]" without
+            // ever running the recovery its own message suggested.
+            (async () => {
+              const nk = setInterval(() => { try { res.write(": keep-alive\n\n"); } catch {} }, 10000);
+              let recovered = null;
+              try { recovered = await recoverTextAfterEmpty(model, chatBody, variant); } catch {}
+              clearInterval(nk);
+              if (recovered && recovered.text) {
+                fullText = recovered.text;
+                if (recovered.tokens) tokens = recovered.tokens;
+                emitResponsesText(fullText, recovered.path || "zen-responses-recovered");
+                resolve({ sessionID, text: fullText, tokens, ms: Date.now() - t0, path: recovered.path || "zen-responses-recovered", streamErr: err.message });
+                return;
+              }
+              const why = "[zen: no response — upstream failed: " + String(err.message || "unknown").slice(0, 160) + " | auto-recovery (smaller prompt + big-pickle) also failed]";
+              try {
+                safeWrite({ type: "response.output_text.delta", item_id: itemId, output_index: 0, content_index: 0, delta: why });
+                safeWrite({ type: "response.output_text.done", item_id: itemId, output_index: 0, content_index: 0, text: why });
+                safeWrite({ type: "response.content_part.done", item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: why, annotations: [] } });
+                safeWrite({ type: "response.output_item.done", output_index: 0, item: { type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text: why, annotations: [] }], status: "completed" } });
+                safeWrite({ type: "response.completed", response: buildResponseObj(respId, model, created, why, tokens, "completed") });
+                res.write("data: [DONE]\n\n");
+                res.end();
+              } catch {}
+              resolve({ sessionID, text: "", tokens, ms: Date.now() - t0, path: "zen-responses-notext", streamErr: err.message });
+            })();
             return;
           }
           try {
@@ -914,13 +930,30 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
       if (err) {
         if (res.headersSent) {
           if (fullText === "") {
-            // Idle-before-delta race: emit error content instead of blank
-            try {
-              res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: "[zen: no response — model may be unavailable, try big-pickle or muse-spark-1.3-contributor-free]" }, finish_reason: "stop" }] })}\n\n`);
-              res.write("data: [DONE]\n\n");
-              res.end();
-            } catch {}
-            resolve({ sessionID, text: "", tokens, ms: Date.now() - t0, path: "zen-stream-notext", streamErr: err.message, chatId });
+            // Idle-before-delta: run last-chance recovery (smaller prompts +
+            // big-pickle) before emitting an error as content.
+            (async () => {
+              let recovered = null;
+              try { recovered = await recoverTextAfterEmpty(model, body, variant); } catch {}
+              if (recovered && recovered.text) {
+                fullText = recovered.text;
+                if (recovered.tokens) tokens = recovered.tokens;
+                try {
+                  res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: fullText }, finish_reason: "stop" }] })}\n\n`);
+                  res.write("data: [DONE]\n\n");
+                  res.end();
+                } catch {}
+                resolve({ sessionID, text: fullText, tokens, ms: Date.now() - t0, path: recovered.path || "zen-stream-recovered", chatId });
+                return;
+              }
+              const why = "[zen: no response — upstream failed: " + String(err.message || "unknown").slice(0, 160) + " | auto-recovery (smaller prompt + big-pickle) also failed]";
+              try {
+                res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: why }, finish_reason: "stop" }] })}\n\n`);
+                res.write("data: [DONE]\n\n");
+                res.end();
+              } catch {}
+              resolve({ sessionID, text: "", tokens, ms: Date.now() - t0, path: "zen-stream-notext", streamErr: err.message, chatId });
+            })();
             return;
           }
           try {
