@@ -41,31 +41,66 @@
     },
     "build": {
       "permission": {
-        "read": "allow", "edit": "allow", "glob": "allow", "grep": "allow", "list": "allow",
-        "bash": "allow", "task": "allow", "external_directory": "allow", "todowrite": "allow",
-        "question": "allow", "webfetch": "allow", "websearch": "allow", "lsp": "allow",
-        "doom_loop": "allow", "skill": "allow"
+        "read": "allow",
+        "edit": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": "allow",
+        "task": "allow",
+        "external_directory": "allow",
+        "todowrite": "allow",
+        "question": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "lsp": "allow",
+        "doom_loop": "allow",
+        "skill": "allow"
       }
     },
     "general": {
       "permission": {
-        "read": "allow", "edit": "allow", "glob": "allow", "grep": "allow", "list": "allow",
-        "bash": "allow", "task": "allow", "external_directory": "allow", "todowrite": "allow",
-        "question": "allow", "webfetch": "allow", "websearch": "allow", "lsp": "allow",
-        "doom_loop": "allow", "skill": "allow"
+        "read": "allow",
+        "edit": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": "allow",
+        "task": "allow",
+        "external_directory": "allow",
+        "todowrite": "allow",
+        "question": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "lsp": "allow",
+        "doom_loop": "allow",
+        "skill": "allow"
       }
     },
     "explore": {
       "permission": {
-        "read": "allow", "edit": "allow", "glob": "allow", "grep": "allow", "list": "allow",
-        "bash": "allow", "task": "allow", "external_directory": "allow", "todowrite": "allow",
-        "question": "allow", "webfetch": "allow", "websearch": "allow", "lsp": "allow",
-        "doom_loop": "allow", "skill": "allow"
+        "read": "allow",
+        "edit": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": "allow",
+        "task": "allow",
+        "external_directory": "allow",
+        "todowrite": "allow",
+        "question": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "lsp": "allow",
+        "doom_loop": "allow",
+        "skill": "allow"
       }
     }
   },
   "attachment": {
-    "image": { "auto_resize": false }
+    "image": {
+      "auto_resize": false
+    }
   },
   "tool_output": {
     "max_lines": 100000,
@@ -157,5 +192,8 @@
       }
     }
   },
-  "persist_workspace": true
+  "persist_workspace": true,
+  "instructions": [
+    "/home/mint/.config/opencode/AGENTS.md"
+  ]
 }

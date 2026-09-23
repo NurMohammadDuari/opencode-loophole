@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-09-23 — Client-side "do everything" protocol (CLI + app)
+
+- **AGENTS.md work protocol** installed at `~/.config/opencode/AGENTS.md` and wired via the
+  `instructions` config key: execute-don't-describe, follow the WHOLE multi-part request,
+  long operations run to completion, fix-and-continue on errors, evidence tables, no scope
+  narrowing. Applies to both `opencode` CLI and the desktop app (shared client config).
+- Live-verified through the real CLI: multi-part task with invented subtasks -> all executed,
+  files created on disk, completion table produced.
+- Synced to repo as `config/AGENTS.md` + `config/client-opencode.json`.
+
+
 All notable changes to this project will be documented in this file.
 
 ## 2026-09-23a — Bridge self-recovery: "zen: no response" now heals instead of apologizing
