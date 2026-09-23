@@ -664,7 +664,11 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
       safeWrite({ type: "response.output_item.added", output_index: 0, item: { type: "message", id: itemId, role: "assistant", content: [], status: "in_progress" } });
       safeWrite({ type: "response.content_part.added", item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
 
-      const timer = setTimeout(() => finish(new Error("zen responses stream timeout")), timeoutMs);
+      let timer = setTimeout(() => finish(new Error("zen responses stream timeout")), timeoutMs);
+      // Activity-reset cap: the wall clock only counts TRUE upstream silence.
+      // Reasoning/tool phases (muse-spark xhigh thinks 3-5 min) emit events
+      // continuously, so without resetting the cap would abort healthy turns.
+      const resetTimer = () => { clearTimeout(timer); timer = setTimeout(() => finish(new Error("zen responses stream timeout")), timeoutMs); };
 
       // Activity tracking: reasoning and tool phases are NORMAL for heavy
       // models (muse-spark can think 3-5 minutes on big agent prompts).
@@ -769,7 +773,7 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
         // ANY event (message updates, part updates, tool events, deltas)
         // means serve is alive — long tool runs and reasoning phases are
         // normal. Only true silence should trip the stall timer.
-        if (!isIdle) lastDeltaAt = Date.now();
+        if (!isIdle) { lastDeltaAt = Date.now(); resetTimer(); }
 
         if (type === "message.updated") {
           const info = props.info || {};
@@ -1042,7 +1046,11 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
 
       res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n`);
 
-      const timer = setTimeout(() => finish(new Error("zen stream timeout")), timeoutMs);
+      let timer = setTimeout(() => finish(new Error("zen stream timeout")), timeoutMs);
+      // Activity-reset cap: the wall clock only counts TRUE upstream silence.
+      // Reasoning/tool phases (muse-spark xhigh thinks 3-5 min) emit events
+      // continuously, so without resetting the cap would abort healthy turns.
+      const resetTimer = () => { clearTimeout(timer); timer = setTimeout(() => finish(new Error("zen stream timeout")), timeoutMs); };
 
       let lastDeltaAt = Date.now();
       const streamStartedAt = Date.now();
@@ -1132,7 +1140,7 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
 
         // ANY event = serve alive (tool runs / reasoning produce no text
         // deltas but ARE progress). Only true silence trips the stall timer.
-        if (!isIdle) lastDeltaAt = Date.now();
+        if (!isIdle) { lastDeltaAt = Date.now(); resetTimer(); }
 
         if (type === "message.updated") {
           const info = props.info || {};
