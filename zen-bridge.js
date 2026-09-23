@@ -16,6 +16,12 @@
  *  - Activity-based deadlines: no more 25s empty-stream kill or 30s remap cap
  *    that aborted healthy desktop agent turns (blank output / endless thinking)
  *  - models-catalog remap: non-working zen models route to a confirmed live model
+ *  - live progress: tool/todo/step narration + multi-message streaming (no more
+ *    "Thinking…" with all work hidden until the final summary)
+ *  - cancellation: client disconnect aborts the upstream run (no background burn)
+ *  - no double execution: recovery aborts the stuck run before re-running it
+ *  - activity-reset timeout: the hard cap only fires on true upstream silence
+ *  - self-healing feed: /event drops trigger reconnect + replay instead of loss
  */
 const http = require("http");
 const crypto = require("crypto");
@@ -169,11 +175,36 @@ function readRotatorTail(n = 5) {
 // status events for the same tool call (running fires many times).
 function narrateToolPart(part, seen) {
   const st = (part && part.state) || {};
-  const tool = (part && part.tool) || "tool";
+  const tool = (part && part.tool) || (part && part.type) || "tool";
   const inp = st.input || {};
   const status = st.status || "";
   const clip = (s, n) => String(s == null ? "" : s).replace(/\s+/g, " ").trim().slice(0, n || 160);
   const nLines = (s) => (s == null || s === "" ? 0 : String(s).split("\n").length);
+
+  // Agent-native progress: todo-list updates and step milestones are real
+  // model-produced status — surface them so long runs are never silent.
+  if (tool === "todowrite" || tool === "todo_write") {
+    if (status !== "running") return null;
+    const items = Array.isArray(inp.todos) ? inp.todos : [];
+    if (!items.length) return null;
+    const body = items
+      .map((t) => (t && t.completed !== false ? "  [x] " + clip(t.task || t.content || "", 90) : "  [ ] " + clip(t.task || t.content || "", 90)))
+      .join("\n");
+    const key = (part && part.id ? part.id : "todo") + ":todo:" + body;
+    if (seen.has(key)) return null;
+    if (seen.size > 400) seen.clear();
+    seen.add(key);
+    try { logActivity({ event: "narration", tool: "todowrite", status, line: "☰ TODO\n" + body }); } catch {}
+    return "☰ TODO\n" + body;
+  }
+  if (tool === "step-finish") {
+    const key = (part && part.id ? part.id : "sf") + ":step-done";
+    if (seen.has(key)) return null;
+    seen.add(key);
+    try { logActivity({ event: "narration", tool: "step-finish", status: "completed", line: "● step completed" }); } catch {}
+    return "● step completed";
+  }
+  if (tool === "step-start") return null;
 
   let detail = "";
   let startSym = "⚙";
@@ -839,6 +870,23 @@ function subscribeEvents(onEvent) {
   let closed = false;
   let currentReq = null;
 
+  let lastEventAt = Date.now();
+  let watchdog = null;
+  // A silent TCP feed while the model is producing output is the dead-feed
+  // failure mode: Node's response never errors, so previously the subscriber
+  // sat silent forever and the bridge showed only the final summary. Now the
+  // watchdog force-reconnects so the stream of live events continues.
+  const FEED_STALE_MS = Number(process.env.FEED_STALE_MS || 20000);
+  function armWatchdog() {
+    if (watchdog) clearTimeout(watchdog);
+    watchdog = setTimeout(() => {
+      if (closed) return;
+      if (Date.now() - lastEventAt > FEED_STALE_MS) {
+        try { if (currentReq) currentReq.destroy(); } catch {}
+      } else armWatchdog();
+    }, FEED_STALE_MS).unref();
+  }
+
   function connect() {
     if (closed) return;
     let buf = "";
@@ -858,6 +906,7 @@ function subscribeEvents(onEvent) {
             if (!line.startsWith("data:")) continue;
             const raw = line.slice(5).trim();
             if (!raw || raw === "[DONE]") continue;
+            lastEventAt = Date.now();
             try { onEvent(JSON.parse(raw)); } catch {}
           }
         }
@@ -866,12 +915,20 @@ function subscribeEvents(onEvent) {
       res.on("error", () => { if (!closed) setTimeout(connect, 500); });
     });
     req.on("error", () => { if (!closed) setTimeout(connect, 500); });
+    req.on("close", () => { if (!closed) setTimeout(connect, 250); });
     req.end();
     currentReq = req;
+    armWatchdog();
   }
 
   connect();
-  return { close() { closed = true; try { if (currentReq) currentReq.destroy(); } catch {} } };
+  return {
+    close() {
+      closed = true;
+      try { if (watchdog) clearTimeout(watchdog); } catch {}
+      try { if (currentReq) currentReq.destroy(); } catch {}
+    },
+  };
 }
 
 function buildParts(body) {
@@ -912,9 +969,11 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
     let tokens = null;
     let settled = false;
     let sub = null;
-    // Part-type tracking (see zenStreamResponsesToClient). Chat SSE clients
-    // ignore unknown delta types; reasoning is also mirrored into chat
-    // stream as `delta.reasoning` for clients that display it.
+    // Part-type tracking (see zenStreamResponsesToClient). Chat SSE clients only
+    // render `delta.content`, so reasoning + tool narration are mirrored into
+    // content (gated by ZEN_STREAM_REASONING) so the turn never stays a silent
+    // "Thinking…" spinner with only the final summary visible.
+    const streamReasoning = process.env.ZEN_STREAM_REASONING !== "0";
     const reasoningPartIds = new Set();
     const textPartIds = new Set();
     const narratedKeys = new Set();
@@ -989,9 +1048,9 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
       const streamStartedAt = Date.now();
       const stallCheck = setInterval(() => {
         if (settled) { clearInterval(stallCheck); return; }
-        if (fullText.length === 0 && Date.now() - streamStartedAt > EMPTY_STREAM_GRACE_MS) {
+        if (fullText.length === 0 && Date.now() - lastDeltaAt > EMPTY_STREAM_GRACE_MS) {
           clearInterval(stallCheck); clearTimeout(timer);
-          console.error("Zen Bridge: no first delta after", EMPTY_STREAM_GRACE_MS, "ms for", model, "— recovering");
+          console.error("Zen Bridge: no activity after", EMPTY_STREAM_GRACE_MS, "ms for", model, "— recovering");
           recoverOrFinish();
           return;
         }
@@ -1084,14 +1143,14 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
             if (part.type === "reasoning") { reasoningPartIds.add(part.id); textPartIds.delete(part.id); }
             else if (part.type === "text") { textPartIds.add(part.id); reasoningPartIds.delete(part.id); }
           }
-          // Narrate tool activity into delta.reasoning so chat clients see
-          // what the agent is doing (commands, edits, diffs) live.
-          if (part.type === "tool") {
+          // Narrate tool activity into delta.content so the client renders the
+          // agent's work (commands, edits, diffs) live instead of a spinner.
+          if (part.type === "tool" && streamReasoning) {
             const line = narrateToolPart(part, narratedKeys);
             if (line) {
               reasoningText += line + "\n";
               try {
-                res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { reasoning: "\n" + line + "\n" }, finish_reason: null }] })}\n\n`);
+                res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: "\n" + line + "\n" }, finish_reason: null }] })}\n\n`);
               } catch {}
             }
           }
@@ -1107,12 +1166,15 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
           const isReasoning = pid ? reasoningPartIds.has(pid) : false;
           const isText = pid ? textPartIds.has(pid) : true;
           if (isReasoning) {
-            // Visible thinking: mirror reasoning into delta.reasoning (OpenAI-
-            // compatible clients that don't know the field simply ignore it).
+            // Stream reasoning as visible content so the client shows live
+            // thinking instead of a silent "Thinking…" spinner that ends in a
+            // summary-only dump. (Chat SSE has no standard separate channel.)
             reasoningText += delta;
-            try {
-              res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { reasoning: delta }, finish_reason: null }] })}\n\n`);
-            } catch {}
+            if (streamReasoning) {
+              try {
+                res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] })}\n\n`);
+              } catch {}
+            }
             return;
           }
           if (!isText) return;

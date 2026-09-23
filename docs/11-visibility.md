@@ -34,9 +34,13 @@ Implementation facts:
 
 - **Responses path** (app + modern clients): official
   `response.reasoning_summary_text.delta` events.
-- **Chat path**: mirrored into the `delta.reasoning` field — clients that
-  don't know the field ignore it safely.
-- Reasoning **never mixes into answer text** — separate channel by design.
+- **Chat path** (OpenAI-compat clients such as OpenCode): chat SSE has no
+  standard reasoning channel, so reasoning + tool narration are mirrored into
+  `delta.content` (gated by `ZEN_STREAM_REASONING`) so the turn stays visible
+  instead of a silent "Thinking…" spinner that ends in a summary-only dump.
+- Reasoning parts are tracked by part id. On the Responses path they stay in a
+  separate thinking block (never mixed into answer text); on the Chat path they
+  are folded into `delta.content` only because no separate channel exists.
 - **De-duplicated**: serve fires repeated `running` updates; each
   `partId:status:detail` line is emitted exactly once (this fixed the
   observed 3× duplicate `⚙` lines).
