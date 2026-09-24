@@ -24,6 +24,8 @@ Environment=EMPTY_STREAM_GRACE_MS=90000
 Environment=RECOVERY_TIMEOUT_MS=45000
 Environment=RECOVERY_MAX_ATTEMPTS=3
 Environment=SESSION_TTL_MS=90000
+# Native tool cards on the Responses path (rendered as mcp.<tool>). 0 = plain text.
+Environment=ZEN_TOOL_CARDS=1
 
 [Install]
 WantedBy=default.target

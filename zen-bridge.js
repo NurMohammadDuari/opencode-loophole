@@ -21,7 +21,20 @@
  *  - cancellation: client disconnect aborts the upstream run (no background burn)
  *  - no double execution: recovery aborts the stuck run before re-running it
  *  - activity-reset timeout: the hard cap only fires on true upstream silence
- *  - self-healing feed: /event drops trigger reconnect + replay instead of loss
+ *  - self-healing feed: a stalled /event TCP feed triggers reconnect so live
+ *    streaming resumes (reconnect only — serve does not replay missed events)
+ *  - real-time visibility (muse-spark xhigh "only Thinking → summary" bug):
+ *      • tool/step/file activity is emitted as VISIBLE output text, not hidden
+ *        in the collapsed reasoning/"Thinking…" channel
+ *      • todo.updated is surfaced as a live checklist (▶ / ☐ / ✔ / ✗)
+ *      • multi-step agent turns: deltas are NOT dropped by the old
+ *        "newest assistant message only" filter
+ *      • session.updated idle detection reads the real key (info, not session)
+ *  - native tool cards (ZEN_TOOL_CARDS=1, Responses path only): each real tool
+ *    run is emitted as a provider-executed `mcp_call` item so the client shows a
+ *    tool CARD (already run) instead of a text line. Renders as `mcp.<tool>`
+ *    because the AI SDK only marks mcp/built-in items provider-executed; a plain
+ *    function_call would make the client execute the tool a SECOND time.
  */
 const http = require("http");
 const crypto = require("crypto");
@@ -375,6 +388,12 @@ function extractAssistantText(messages) {
   return { text, tokens };
 }
 
+/** Abort an in-flight serve run so recovery never executes the same task twice. */
+function abortRun(sessionID) {
+  if (!sessionID) return Promise.resolve();
+  return callServe("POST", `/session/${sessionID}/abort`, {}, 5000).catch(() => {});
+}
+
 /** When stream idles with no text, retry with progressively smaller bodies + big-pickle. */
 async function recoverTextAfterEmpty(model, chatBody, variant) {
   // big-pickle first: it is the fastest, most reliable model, and the original
@@ -565,6 +584,12 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
     const reasoningPartIds = new Set();
     const textPartIds = new Set();
     const narratedKeys = new Set();
+    // De-dupe the visible task-list line so repeated todo.updated events do not
+    // spam the client with an identical checklist.
+    let lastTodoSig = "";
+    // Guard: never stream deltas that explicitly belong to a user/system message
+    // (only the assistant's own parts should ever reach the client).
+    const userMsgIds = new Set();
     // Stream reasoning deltas as official Responses reasoning-summary events
     // so clients show live "thinking" instead of an endless spinner.
     // Disable with ZEN_STREAM_REASONING=0.
@@ -584,7 +609,7 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
       settled = true;
       if (sub) sub.close();
       setTimeout(() => {
-        if (sessionID) callServe("DELETE", `/session/${sessionID}`, SESSION_TTL_MS).catch(() => {});
+        if (sessionID) callServe("DELETE", `/session/${sessionID}`, null, SESSION_TTL_MS).catch(() => {});
       }, SESSION_TTL_MS);
       if (err) {
         if (res.headersSent) {
@@ -594,6 +619,7 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
             // ever running the recovery its own message suggested.
             (async () => {
               const nk = setInterval(() => { try { res.write(": keep-alive\n\n"); } catch {} }, 10000);
+              await abortRun(sessionID); // stop the stuck run before re-running it
               let recovered = null;
               try { recovered = await recoverTextAfterEmpty(model, chatBody, variant); } catch {}
               clearInterval(nk);
@@ -696,12 +722,66 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
         }
       }, 2000);
 
+      // Cancellation: if the client goes away mid-run, abort the upstream serve
+      // run so we do NOT keep working (and burning tokens) in the background.
+      // No recovery/re-run on disconnect — that is what the client asked for.
+      const onClientClose = () => {
+        if (settled) return;
+        settled = true;
+        if (sub) sub.close();
+        clearTimeout(timer); clearInterval(stallCheck); clearInterval(heartbeat);
+        if (sessionID) callServe("POST", `/session/${sessionID}/abort`, {}, 5000).catch(() => {});
+        try { logActivity({ event: "client-abort", sessionID, model, ms: Date.now() - t0, chars: fullText.length }); } catch {}
+        setTimeout(() => { if (sessionID) callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {}); }, SESSION_TTL_MS);
+        resolve({ sessionID, text: fullText, tokens, ms: Date.now() - t0, path: "client-abort" });
+      };
+      res.on("close", onClientClose);
+
       function emitReasoningDone() {
         if (!reasoningStarted) return;
         try {
           safeWrite({ type: "response.reasoning_summary_text.done", item_id: reasoningItemId, output_index: 1, content_index: 0, text: "" });
           safeWrite({ type: "response.output_item.done", output_index: 1, item: { type: "reasoning", id: reasoningItemId, summary: [], status: "completed" } });
         } catch {}
+      }
+
+      // Foreground activity line: written as VISIBLE output text (the channel the
+      // client renders as the assistant's live message) so real tool/todo/file
+      // events are observable. Appended to fullText so the final done event matches.
+      function emitActivity(line) {
+        if (!line) return;
+        const piece = "\n" + line + "\n";
+        fullText += piece;
+        safeWrite({ type: "response.output_text.delta", item_id: itemId, output_index: 0, content_index: 0, delta: piece });
+      }
+
+      // ZEN_TOOL_CARDS=1: render each real tool run as a native OpenCode tool CARD
+      // instead of a text line. Uses the OpenAI Responses `mcp_call` item, which
+      // the AI SDK maps to a tool-call with providerExecuted:true (already run) +
+      // a matching tool-result — so the client renders a completed card and does
+      // NOT re-execute the tool.  Verified against the installed client parser.
+      const nativeToolCards = /^(1|mcp|true|on)$/i.test(process.env.ZEN_TOOL_CARDS || "");
+      let toolCardIndex = 20;
+      function emitToolActivity(part, line) {
+        const st = (part && part.state) || {};
+        const status = st.status || "";
+        if (nativeToolCards && (status === "completed" || status === "error")) {
+          const raw = (st.metadata && (st.metadata.output || st.metadata.error)) || st.output || st.error || "";
+          const item = {
+            type: "mcp_call",
+            id: (part && part.id) || ("call_" + crypto.randomBytes(6).toString("hex")),
+            name: (part && part.tool) || "tool",
+            arguments: JSON.stringify(st.input || {}),
+            server_label: "zen",
+            output: String(raw == null ? "" : raw).slice(0, 4000),
+          };
+          const idx = toolCardIndex++;
+          safeWrite({ type: "response.output_item.added", output_index: idx, item });
+          safeWrite({ type: "response.output_item.done", output_index: idx, item });
+          try { logActivity({ event: "tool-card", tool: item.name, status: status || "completed" }); } catch {}
+          return;
+        }
+        emitActivity(line);
       }
 
       function emitResponsesText(text, pathTag) {
@@ -727,7 +807,8 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
                 if (got.text) { fullText = got.text; if (got.tokens) tokens = got.tokens; }
               }
               if (fullText === "") {
-                console.error("Zen Bridge: idle-no-delta for", model, "— recovering via sync/big-pickle");
+                console.error("Zen Bridge: idle-no-delta for", model, "— aborting run, recovering via sync/big-pickle");
+                await abortRun(sessionID); // stop the stuck run before re-running it
                 const recovered = await recoverTextAfterEmpty(model, chatBody);
                 if (recovered && recovered.text) {
                   fullText = recovered.text;
@@ -768,7 +849,7 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
         const isIdle =
           type === "session.idle" ||
           (type === "session.status" && props.status && props.status.type === "idle") ||
-          (type === "session.updated" && props.session && props.session.time && props.session.time.completed);
+          (type === "session.updated" && props.info && props.info.time && props.info.time.completed);
 
         // ANY event (message updates, part updates, tool events, deltas)
         // means serve is alive — long tool runs and reasoning phases are
@@ -778,6 +859,7 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
         if (type === "message.updated") {
           const info = props.info || {};
           if (info.role === "assistant" && info.id) { assistantMsgId = info.id; if (info.tokens) tokens = info.tokens; }
+          else if (info.role === "user" && info.id) userMsgIds.add(info.id);
         }
 
         if (type === "message.part.updated" || type === "message.part-updated") {
@@ -786,27 +868,42 @@ function zenStreamResponsesToClient(res, model, chatBody, timeoutMs, variant) {
             if (part.type === "reasoning") { reasoningPartIds.add(part.id); textPartIds.delete(part.id); }
             else if (part.type === "text") { textPartIds.add(part.id); reasoningPartIds.delete(part.id); }
           }
-          // Narrate tool activity into the reasoning channel so clients see
-          // WHAT the agent is doing (commands, file edits, diffs, reads)
-          // instead of a silent spinner. Reasoning channel only — never the
-          // answer text. Disable with ZEN_STREAM_REASONING=0.
-          if (part.type === "tool" && streamReasoning) {
+          // Surface REAL tool activity (command, file read/edit/write with diff
+          // preview, output, error) as VISIBLE foreground output, so the client
+          // shows the work as it happens instead of hiding it in the collapsed
+          // reasoning/"Thinking…" channel. Derived from actual serve tool parts —
+          // never fabricated, and never the model's private reasoning.
+          if (part.type === "tool") {
             const line = narrateToolPart(part, narratedKeys);
-            if (line) {
-              if (!reasoningStarted) {
-                reasoningStarted = true;
-                safeWrite({ type: "response.output_item.added", output_index: 1, item: { type: "reasoning", id: reasoningItemId, summary: [], status: "in_progress" } });
-              }
-              safeWrite({ type: "response.reasoning_summary_text.delta", item_id: reasoningItemId, output_index: 1, content_index: 0, delta: "\n" + line + "\n" });
+            if (line) emitToolActivity(part, line);
+          }
+        }
+
+        // The agent's task list (todowrite) is a REAL execution milestone: stream
+        // it as a visible checklist so the plan and progress are not hidden.
+        if (type === "todo.updated") {
+          const todos = Array.isArray(props.todos) ? props.todos : [];
+          if (todos.length) {
+            const sig = todos.map((t) => (t && t.status) + "|" + ((t && (t.content || t.title)) || "")).join("\n");
+            if (sig && sig !== lastTodoSig) {
+              lastTodoSig = sig;
+              const mark = (s) => (s === "completed" ? "✔" : s === "in_progress" ? "▶" : s === "cancelled" ? "✗" : "☐");
+              const lines = todos.map((t) => mark(t && t.status) + " " + String((t && (t.content || t.title)) || "").replace(/\s+/g, " ").trim().slice(0, 120)).join("\n");
+              emitActivity("─ task list ─\n" + lines);
             }
           }
         }
 
         if (type === "message.part.delta") {
-          if (assistantMsgId && props.messageID && props.messageID !== assistantMsgId) return;
           const pid = props.partID || null;
           const delta = props.delta || "";
           if (!delta) return;
+          if (props.messageID && userMsgIds.has(props.messageID)) return;
+          // Do NOT drop deltas whose messageID differs from the last announced
+          // assistant message: an agent turn produces MULTIPLE assistant messages
+          // (one per step), and the old filter discarded every delta that was not
+          // the newest one — exactly why long turns showed only the final summary.
+          // Session scoping above already excludes other sessions.
           if (!assistantMsgId && props.messageID) assistantMsgId = props.messageID;
           // Reasoning parts stream as reasoning-summary events (visible
           // thinking) — they never mix into the answer text.
@@ -981,7 +1078,8 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
     const reasoningPartIds = new Set();
     const textPartIds = new Set();
     const narratedKeys = new Set();
-    let reasoningText = "";
+    const userMsgIds = new Set();
+    let lastTodoSig = "";
     const chatId = "chatcmpl-" + crypto.randomBytes(8).toString("hex");
 
     const finish = (err) => {
@@ -996,6 +1094,7 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
             // Idle-before-delta: run last-chance recovery (smaller prompts +
             // big-pickle) before emitting an error as content.
             (async () => {
+              await abortRun(sessionID); // stop the stuck run before re-running it
               let recovered = null;
               try { recovered = await recoverTextAfterEmpty(model, body, variant); } catch {}
               if (recovered && recovered.text) {
@@ -1075,6 +1174,19 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
         }
       }, 2000);
 
+      // Cancellation: client disconnect aborts the upstream run (no background burn).
+      const onClientClose = () => {
+        if (settled) return;
+        settled = true;
+        if (sub) sub.close();
+        clearTimeout(timer); clearInterval(stallCheck);
+        if (sessionID) callServe("POST", `/session/${sessionID}/abort`, {}, 5000).catch(() => {});
+        try { logActivity({ event: "client-abort", sessionID, model, ms: Date.now() - t0, chars: fullText.length }); } catch {}
+        setTimeout(() => { if (sessionID) callServe("DELETE", `/session/${sessionID}`, null, 5000).catch(() => {}); }, SESSION_TTL_MS);
+        resolve({ sessionID, text: fullText, tokens, ms: Date.now() - t0, path: "client-abort" });
+      };
+      res.on("close", onClientClose);
+
       async function recoverOrFinish() {
         if (settled) return;
         if (fullText !== "") {
@@ -1097,7 +1209,8 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
         } catch {}
         if (settled) return;
         if (fullText === "") {
-          console.error("Zen Bridge: idle-no-delta for", model, "— recovering via sync/big-pickle");
+          console.error("Zen Bridge: idle-no-delta for", model, "— aborting run, recovering via sync/big-pickle");
+          await abortRun(sessionID); // stop the stuck run before re-running it
           const recovered = await recoverTextAfterEmpty(model, body);
           if (settled) return;
           if (recovered && recovered.text) {
@@ -1136,7 +1249,7 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
         const isIdle =
           type === "session.idle" ||
           (type === "session.status" && props.status && props.status.type === "idle") ||
-          (type === "session.updated" && props.session && props.session.time && props.session.time.completed);
+          (type === "session.updated" && props.info && props.info.time && props.info.time.completed);
 
         // ANY event = serve alive (tool runs / reasoning produce no text
         // deltas but ARE progress). Only true silence trips the stall timer.
@@ -1145,7 +1258,10 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
         if (type === "message.updated") {
           const info = props.info || {};
           if (info.role === "assistant" && info.id) { assistantMsgId = info.id; if (info.tokens) tokens = info.tokens; }
-        }        if (type === "message.part.updated" || type === "message.part-updated") {
+          else if (info.role === "user" && info.id) userMsgIds.add(info.id);
+        }
+
+        if (type === "message.part.updated" || type === "message.part-updated") {
           const part = props.part || {};
           if (part && part.id) {
             if (part.type === "reasoning") { reasoningPartIds.add(part.id); textPartIds.delete(part.id); }
@@ -1156,7 +1272,6 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
           if (part.type === "tool" && streamReasoning) {
             const line = narrateToolPart(part, narratedKeys);
             if (line) {
-              reasoningText += line + "\n";
               try {
                 res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: "\n" + line + "\n" }, finish_reason: null }] })}\n\n`);
               } catch {}
@@ -1164,11 +1279,26 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
           }
         }
 
+        if (type === "todo.updated") {
+          const todos = Array.isArray(props.todos) ? props.todos : [];
+          if (todos.length) {
+            const sig = todos.map((t) => (t && t.status) + "|" + ((t && (t.content || t.title)) || "")).join("\n");
+            if (sig && sig !== lastTodoSig) {
+              lastTodoSig = sig;
+              const mark = (s) => (s === "completed" ? "✔" : s === "in_progress" ? "▶" : s === "cancelled" ? "✗" : "☐");
+              const lines = todos.map((t) => mark(t && t.status) + " " + String((t && (t.content || t.title)) || "").replace(/\s+/g, " ").trim().slice(0, 120)).join("\n");
+              try {
+                res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: "\n─ task list ─\n" + lines + "\n" }, finish_reason: null }] })}\n\n`);
+              } catch {}
+            }
+          }
+        }
+
         if (type === "message.part.delta") {
-          if (assistantMsgId && props.messageID && props.messageID !== assistantMsgId) return;
           const pid = props.partID || null;
           const delta = props.delta || "";
           if (!delta) return;
+          if (props.messageID && userMsgIds.has(props.messageID)) return;
           if (!assistantMsgId && props.messageID) assistantMsgId = props.messageID;
 
           const isReasoning = pid ? reasoningPartIds.has(pid) : false;
@@ -1177,7 +1307,6 @@ function zenStreamToClient(res, model, body, timeoutMs, variant) {
             // Stream reasoning as visible content so the client shows live
             // thinking instead of a silent "Thinking…" spinner that ends in a
             // summary-only dump. (Chat SSE has no standard separate channel.)
-            reasoningText += delta;
             if (streamReasoning) {
               try {
                 res.write(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] })}\n\n`);
